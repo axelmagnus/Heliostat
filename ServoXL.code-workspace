@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../libraries/Adafruit_IO_Arduino"
+		}
+	],
+	"settings": {}
+}
