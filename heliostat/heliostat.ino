@@ -6,18 +6,22 @@
 #include "config.h" // Adafruit IO credentials
 #include <AdafruitIO_WiFi.h>
 #include <esp_sleep.h>
+#include <Adafruit_INA219.h>
 
 // --- Tuning constants ---
-struct ServoConfig {
+struct ServoConfig
+{
     uint8_t azimuthChannel = 0;
-    uint16_t azMin = 150; // 0 deg (due west)
-    uint16_t azMax = 460; // ~170 deg (due east)
-    float azRangeDeg = 170.0;
+    float azMinDeg = 80.0;     // Minimum azimuth in degrees (e.g., east)
+    float azMaxDeg = 280.0;    // Maximum azimuth in degrees (e.g., west)
+    uint16_t azMinPulse = 480; // Pulse for azMinDeg
+    uint16_t azMaxPulse = 100; // Pulse for azMaxDeg
 
     uint8_t elevationChannel = 1;
-    uint16_t elMin = 370; // 0 deg (horizontal)
-    uint16_t elMax = 490; // ~45 deg
-    float elRangeDeg = 45.0;
+    float elMinDeg = 30.0;     // Minimum elevation in degrees (from horizon)
+    float elMaxDeg = 90.0;     // Maximum elevation in degrees (straight up)
+    uint16_t elMinPulse = 480; // Pulse for elMinDeg
+    uint16_t elMaxPulse = 370; // Pulse for elMaxDeg
 };
 ServoConfig servoConfig;
 
@@ -25,19 +29,29 @@ ServoConfig servoConfig;
 float latitude = 55.6;  // degrees
 float longitude = 13.0; // degrees
 
-#define SERVO_FREQ 50 // Hz
+float busVoltage;
+float current;
 
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+#define SERVO_FREQ 50 // Hz
+int ENPin = 15;       // to shut off the booster
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x41);
 
 // --- Adafruit IO Time Subscription ---
 AdafruitIO_Time *iso = io.time(AIO_TIME_ISO);
+// set up the group
+AdafruitIO_Group *group = io.group("heliostat");
+
+Adafruit_INA219 ina219;
 
 volatile time_t latestTime = 0;
 
 // Parse ISO-8601 string to time_t (UTC)
-time_t parseISO8601(const char *isoStr) {
+time_t parseISO8601(const char *isoStr)
+{
     int year, month, day, hour, minute, second;
-    if (sscanf(isoStr, "%4d-%2d-%2dT%2d:%2d:%2d", &year, &month, &day, &hour, &minute, &second) == 6) {
+    if (sscanf(isoStr, "%4d-%2d-%2dT%2d:%2d:%2d", &year, &month, &day, &hour, &minute, &second) == 6)
+    {
         struct tm t;
         t.tm_year = year - 1900;
         t.tm_mon = month - 1;
@@ -46,13 +60,19 @@ time_t parseISO8601(const char *isoStr) {
         t.tm_min = minute;
         t.tm_sec = second;
         t.tm_isdst = 0;
+        Serial.print("Parsed Time: ");
+        Serial.print(hour);
+        Serial.print(":");
+        Serial.println(minute);
+
         return mktime(&t);
     }
     return 0;
 }
 
 // ISO time callback
-void handleISO(char *data, uint16_t len) {
+void handleISO(char *data, uint16_t len)
+{
     latestTime = parseISO8601(data);
     Serial.print("ISO Feed: ");
     Serial.println(data);
@@ -109,8 +129,7 @@ void calcSolarAzEl(time_t t, float latitude_deg, float longitude_deg, float &azi
     float solarMeanAnomaly = DEG_TO_RAD * fmod(357.5291 + 35999.0503 * elapsedT, 360);
     float earthOrbitEccentricity = 0.016708617 - 0.000042037 * elapsedT;
 
-    float sunCenter = DEG_TO_RAD *
-                      ((1.9146 - 0.004847 * elapsedT) * sin(solarMeanAnomaly) + (0.019993 - 0.000101 * elapsedT) * sin(2 * solarMeanAnomaly) + 0.00029 * sin(3 * solarMeanAnomaly));
+    float sunCenter = DEG_TO_RAD * ((1.9146 - 0.004847 * elapsedT) * sin(solarMeanAnomaly) + (0.019993 - 0.000101 * elapsedT) * sin(2 * solarMeanAnomaly) + 0.00029 * sin(3 * solarMeanAnomaly));
 
     float solarTrueAnomaly = solarMeanAnomaly + sunCenter;
     float equatorObliquity = DEG_TO_RAD * (23 + 26 / 60. + 21.448 / 3600. - 46.815 / 3600 * elapsedT);
@@ -125,9 +144,7 @@ void calcSolarAzEl(time_t t, float latitude_deg, float longitude_deg, float &azi
     float Declination = asin(sin(equatorObliquity) * sin(solarTrueLongitude));
     float hourAngle = DEG_TO_RAD * GreenwichHourAngle + Longitude - rightAscension;
 
-    azimuth_deg = (PI + atan2(sin(hourAngle),
-                              cos(hourAngle) * sin(Latitude) - tan(Declination) * cos(Latitude))) *
-                  RAD_TO_DEG;
+    azimuth_deg = (PI + atan2(sin(hourAngle), cos(hourAngle) * sin(Latitude) - tan(Declination) * cos(Latitude))) * RAD_TO_DEG;
 
     elevation_deg = asin(sin(Latitude) * sin(Declination) + cos(Latitude) * cos(Declination) * cos(hourAngle)) * RAD_TO_DEG;
 }
@@ -135,59 +152,124 @@ void calcSolarAzEl(time_t t, float latitude_deg, float longitude_deg, float &azi
 // --- Map degrees to servo pulse ---
 uint16_t mapAzimuthToPulse(float azDeg)
 {
-    azDeg = constrain(azDeg, 0, servoConfig.azRangeDeg);
-    return map(azDeg, 0, servoConfig.azRangeDeg, servoConfig.azMin, servoConfig.azMax);
+    // Constrain to config range
+    azDeg = constrain(azDeg, servoConfig.azMinDeg, servoConfig.azMaxDeg);
+    return map(azDeg,
+               servoConfig.azMinDeg, servoConfig.azMaxDeg,
+               servoConfig.azMinPulse, servoConfig.azMaxPulse);
 }
+
 uint16_t mapElevationToPulse(float elDeg)
 {
-    elDeg = constrain(elDeg, 0, servoConfig.elRangeDeg);
-    return map(elDeg, 0, servoConfig.elRangeDeg, servoConfig.elMin, servoConfig.elMax);
+    elDeg = constrain(elDeg, servoConfig.elMinDeg, servoConfig.elMaxDeg);
+    return map(elDeg,
+               servoConfig.elMinDeg, servoConfig.elMaxDeg,
+               servoConfig.elMinPulse, servoConfig.elMaxPulse);
+}
+void collectData()
+{
+    Serial.println("Collect and send data.");
+    // Measure data from the INA219 and send to Adafruit IO using group publish
+    if (!ina219.begin())
+    {
+        Serial.println("Failed to find INA219 chip");
+    }
+    delay(200);
+    busVoltage = ina219.getBusVoltage_V();
+    current = 0;
+    Serial.println(millis());
+    // Sample the current 500 times and make an average
+    for (int i = 0; i < 500; i++)
+    {
+        current += ina219.getCurrent_mA();
+    }
+    current /= 500;
+    Serial.println(millis());
+
+    Serial.print("Bus Voltage: ");
+    Serial.print(busVoltage);
+    Serial.println(" V");
+    Serial.print("Current: ");
+    Serial.print(current);
+    Serial.println(" mA");
+    float power = busVoltage * current; // in mWatts
+}
+
+void send_data(float azi, float elv)
+{
+    // Send data to Adafruit IO using group publish
+    group->set("bus_voltage", busVoltage);
+    group->set("current", current);
+    group->set("elevation", elv);
+    group->set("azimuth", azi);
+    group->save();
+    io.run();
 }
 
 void setup()
 {
     Serial.begin(115200);
-    Serial.println("Heliostat waking up...");
+    Serial.println("Collecting data..");
+    collectData();
+    pinMode(ENPin, OUTPUT);
 
     // Adafruit IO setup
     io.connect();
     iso->onMessage(handleISO);
     Serial.println(WIFI_SSID);
-    int tries=0;
-    
-    while(io.status() < AIO_CONNECTED) {
+    int tries = 0;
+
+    while (io.status() < AIO_CONNECTED)
+    {
         Serial.print(tries++);
         Serial.println(io.statusText());
         delay(500);
     }
-    
+
     Serial.println();
     Serial.println(io.statusText());
     delay(10);
 
     // Wait for ISO time to arrive
     unsigned long start = millis();
-    while(latestTime < 1000000000 && millis() - start < 10000) { // wait max 10s
+    while (latestTime < 1000000000 && millis() - start < 10000)
+    { // wait max 10s
         io.run();
         Serial.println("io.run");
         delay(100);
     }
 
-    if (latestTime > 1000000000) {
-        //start the servos if you got time
-        pwm.begin();
-        pwm.setOscillatorFrequency(27000000);
-        pwm.setPWMFreq(SERVO_FREQ);
-
+    if (latestTime > 1000000000) // Got time, get direction
+    {
         float azimuth, elevation;
         calcSolarAzEl(latestTime, latitude, longitude, azimuth, elevation);
-
+        azimuth -= 180; // to get zero at due south
         uint16_t azPulse = mapAzimuthToPulse(azimuth);
         uint16_t elPulse = mapElevationToPulse(elevation);
 
-        pwm.setPWM(servoConfig.azimuthChannel, 0, azPulse);
-        pwm.setPWM(servoConfig.elevationChannel, 0, elPulse);
-        delay(1000);
+        // Only cahnge the panel if elevation is above 0, that is, the sun is up
+        if (elevation > 0)
+        {
+            Serial.println("Directing panel..");
+            // Enable power boost
+            digitalWrite(ENPin, HIGH);
+            delay(500);
+            // start the servos if you got time
+
+            pwm.begin();
+            pwm.setOscillatorFrequency(27000000);
+            pwm.setPWMFreq(SERVO_FREQ);
+
+            pwm.setPWM(servoConfig.azimuthChannel, 0, azPulse);
+            pwm.setPWM(servoConfig.elevationChannel, 0, elPulse);
+            delay(2000);
+            // Turn off azimuth and elevation servos
+            pwm.setPWM(servoConfig.azimuthChannel, 0, 0);
+            pwm.setPWM(servoConfig.elevationChannel, 0, 0);
+            delay(300);
+            // Turn off boost before measuring
+            digitalWrite(ENPin, LOW);
+        }
         Serial.print("Azimuth: ");
         Serial.print(azimuth);
         Serial.print(" deg, pulse: ");
@@ -196,15 +278,15 @@ void setup()
         Serial.print(elevation);
         Serial.print(" deg, pulse: ");
         Serial.println(elPulse);
-    } else {
+
+        send_data(azimuth, elevation);
+    }
+    else
+    {
         Serial.println("No valid time received.");
     }
-
-    Serial.println("Sleeping for 1 minutes...");
-    // Turn off azimuth and elevation servos
-    pwm.setPWM(servoConfig.azimuthChannel, 0, 0);
-    pwm.setPWM(servoConfig.elevationChannel, 0, 0);
-    esp_deep_sleep(1 * 60 * 1000000ULL); // 10 minutes in microseconds
+    Serial.println("Sleeping for 10 minutes...");
+    esp_deep_sleep(10 * 60 * 1000000ULL); // 10 minutes in microseconds
 }
 
 void loop()
