@@ -38,7 +38,31 @@ void setup()
     {
         Serial.println("ERROR: Failed to find INA219 chip. Halting.");
     }
-    Serial.println("starting EPD");
+    current = 0;
+
+    for (int i = 0; i < BATT_SAMPLE_SIZE; i++)
+    {
+        float mA = ina219.getCurrent_mA();
+        current += mA;
+    }
+    current /= BATT_SAMPLE_SIZE;
+    Serial.println(current);
+    Serial.println(ina219.getBusVoltage_V());
+    //if voltage is below 3.3 V go to sleep again
+    if (ina219.getBusVoltage_V() < 3.3)
+    {
+        Serial.println("Bus voltage low, going to sleep.");
+
+        // Blink LED 3 times
+        for (int i = 0; i < 3; i++)
+        {
+            digitalWrite(13, HIGH);
+            delay(100);
+            digitalWrite(13, LOW);
+            delay(100);
+        }
+        esp_deep_sleep(SLEEP_MINUTES * 60 * 1000000ULL);
+    }
 
     // Adafruit IO setup
     Serial.println(WIFI_SSID);
@@ -52,16 +76,6 @@ void setup()
         aioTries++;
     }
 
-    current = 0;
-
-    for (int i = 0; i < BATT_SAMPLE_SIZE; i++)
-    {
-        float mA = ina219.getCurrent_mA();
-        current += mA;
-    }
-    current /= BATT_SAMPLE_SIZE;
-    Serial.println(current);
-    Serial.println(ina219.getBusVoltage_V());
     display.begin(THINKINK_TRICOLOR);
     Serial.println("Started EPD");
 

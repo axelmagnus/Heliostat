@@ -1,42 +1,3 @@
-// Global variables for blip measurement and ratio
-int blipCountMeasured = 0;
-float blipRatio = 0.0;
-// --- Blip counting for burst current measurement ---
-#define BLIP_PIN A2 // Example pin for blip detection
-volatile int blipCount = 0;
-#define SLEEP_MINUTES 10
-float azimuth = 180.0;
-float elevation = 45.0;
-#define BATTERY_PIN A13 // Example ADC pin for battery measurement
-
-// Interrupt Service Routine: only increment the counter
-void IRAM_ATTR onBlip()
-{
-    blipCount++;
-}
-
-// Attach interrupt, count blips for a fixed window, then detach
-// No timing inside ISR; all timing in main code
-float measureBlipCurrent(uint8_t pin, uint16_t windowMs)
-{
-    blipCount = 0;
-    attachInterrupt(digitalPinToInterrupt(pin), onBlip, FALLING);
-    unsigned long start = millis();
-    while (millis() - start < windowMs)
-    {
-        // Wait for windowMs, ISR counts blips
-    }
-    detachInterrupt(digitalPinToInterrupt(pin));
-    // Map blipCount to current (tuning required)
-    // Example: 1 blip = 1 mA (adjust as needed)
-    float mappedCurrent = blipCount * 1.0; // TODO: tune this factor
-    Serial.print("Blip count: ");
-    Serial.print(blipCount);
-    Serial.print(", mapped current: ");
-    Serial.println(mappedCurrent);
-    // Return blip count  ratio
-    return blipCount / windowMs;
-}
 // Heliostat controller with deep sleep (ESP32)
 
 #include <Wire.h>
@@ -99,6 +60,10 @@ time_t parseISO8601(const char *isoStr)
         t.tm_min = minute;
         t.tm_sec = second;
         t.tm_isdst = 0;
+        Serial.print("Parsed Time: ");
+        Serial.print(hour);
+        Serial.print(":");
+        Serial.println(minute);
 
         return mktime(&t);
     }
@@ -109,8 +74,8 @@ time_t parseISO8601(const char *isoStr)
 void handleISO(char *data, uint16_t len)
 {
     latestTime = parseISO8601(data);
-    // Serial.print("ISO Feed: ");
-    // Serial.println(data);
+    Serial.print("ISO Feed: ");
+    Serial.println(data);
 }
 
 // --- Solar position calculation ---
@@ -205,83 +170,38 @@ void collectData()
 {
     Serial.println("Collect and send data.");
     // Measure data from the INA219 and send to Adafruit IO using group publish
-    // Measure battery with inbuilt ADC
-    float batteryLevel = analogRead(BATTERY_PIN) / 4096.0 * 3.3 * 2 * 1.1;
-    Serial.print("Battery Level: ");
-    Serial.println(batteryLevel);
-    Serial.print("ADC on CHRG:");
-    Serial.println(analogRead(BLIP_PIN));
-
     if (!ina219.begin())
     {
         Serial.println("Failed to find INA219 chip");
-        busVoltage = batteryLevel;
     }
-    else
-    { // measure
-        delay(200);
-        busVoltage = ina219.getBusVoltage_V();
-        if (ina219.getBusVoltage_V() < 3.3)
-        {
-            Serial.println("Bus voltage low, going to sleep.");
-            // Blink LED 3 times
-            for (int i = 0; i < 3; i++)
-            {
-                digitalWrite(13, HIGH);
-                delay(100);
-                digitalWrite(13, LOW);
-                delay(100);
-            }
-            esp_deep_sleep(SLEEP_MINUTES * 60 * 1000000ULL);
-        }
-        current = 0;
-        Serial.println(millis());
-        // Sample the current 500 times and make an average
-        for (int i = 0; i < 500; i++)
-        {
-            current += ina219.getCurrent_mA();
-        }
-        current /= 500;
-        Serial.println(millis());
-
-        Serial.print("INA219 avg current: ");
-        Serial.println(current);
-
-        Serial.print("Bus Voltage: ");
-        Serial.print(busVoltage);
-
-        Serial.println(" V");
-    }
-
-    // Blip-based current measurement (100 ms window)
-    blipCountMeasured = measureBlipCurrent(BLIP_PIN, 100);
-    blipRatio = 0.0;
-    // Serial.print("Blip count: ");
-    // Serial.println(blipCountMeasured);
-    if (blipCountMeasured > 0)
+    delay(200);
+    busVoltage = ina219.getBusVoltage_V();
+    current = 0;
+    Serial.println(millis());
+    // Sample the current 500 times and make an average
+    for (int i = 0; i < 500; i++)
     {
-        blipRatio = current / blipCountMeasured;
-        Serial.print("INA219 current / blip count ratio: ");
-        Serial.println(blipRatio, 4);
+        current += ina219.getCurrent_mA();
     }
-    else
-    {
-        Serial.println("No blips detected, ratio undefined.");
-    }
+    current /= 500;
+    Serial.println(millis());
+
+    Serial.print("Bus Voltage: ");
+    Serial.print(busVoltage);
+    Serial.println(" V");
+    Serial.print("Current: ");
+    Serial.print(current);
+    Serial.println(" mA");
+    float power = busVoltage * current; // in mWatts
 }
 
 void send_data(float azi, float elv)
 {
     // Send data to Adafruit IO using group publish
-    Serial.println("Sending data");
-    int chrgadc = analogRead(BLIP_PIN);
     group->set("bus_voltage", busVoltage);
     group->set("current", current);
     group->set("elevation", elv);
     group->set("azimuth", azi);
-    group->set("blip_count", blipCountMeasured);
-    group->set("blip_ratio", blipRatio);
-    group->set("chrg_adc", chrgadc);
     group->save();
     io.run();
 }
@@ -292,9 +212,6 @@ void setup()
     Serial.println("Collecting data..");
     collectData();
     pinMode(ENPin, OUTPUT);
-    pinMode(13, OUTPUT);
-    pinMode(BLIP_PIN, INPUT);
-    pinMode(BATTERY_PIN, INPUT);
 
     // Adafruit IO setup
     io.connect();
@@ -302,10 +219,9 @@ void setup()
     Serial.println(WIFI_SSID);
     int tries = 0;
 
-    while (io.status() < AIO_CONNECTED && tries < 20)
+    while (io.status() < AIO_CONNECTED)
     {
         Serial.print(tries++);
-        digitalWrite(13, tries % 2 + 1);
         Serial.println(io.statusText());
         delay(500);
     }
@@ -323,10 +239,11 @@ void setup()
         delay(100);
     }
 
-    if (latestTime > 1000000000) // Got internet and time, get direction
+    if (latestTime > 1000000000) // Got time, get direction
     {
+        float azimuth, elevation;
         calcSolarAzEl(latestTime, latitude, longitude, azimuth, elevation);
-
+        azimuth -= 180; // to get zero at due south
         uint16_t azPulse = mapAzimuthToPulse(azimuth);
         uint16_t elPulse = mapElevationToPulse(elevation);
 
@@ -352,25 +269,24 @@ void setup()
             delay(300);
             // Turn off boost before measuring
             digitalWrite(ENPin, LOW);
-
-            Serial.print("Azimuth: ");
-            Serial.print(azimuth);
-            Serial.print(" deg, pulse: ");
-            Serial.println(azPulse);
-            Serial.print("Elevation: ");
-            Serial.print(elevation);
-            Serial.print(" deg, pulse: ");
-            Serial.println(elPulse);
         }
+        Serial.print("Azimuth: ");
+        Serial.print(azimuth);
+        Serial.print(" deg, pulse: ");
+        Serial.println(azPulse);
+        Serial.print("Elevation: ");
+        Serial.print(elevation);
+        Serial.print(" deg, pulse: ");
+        Serial.println(elPulse);
+
+        send_data(azimuth, elevation);
     }
     else
     {
         Serial.println("No valid time received.");
     }
-
-    send_data(azimuth, elevation);
     Serial.println("Sleeping for 10 minutes...");
-    esp_deep_sleep(SLEEP_MINUTES * 60 * 1000000ULL); // 10 minutes in microseconds
+    esp_deep_sleep(10 * 60 * 1000000ULL); // 10 minutes in microseconds
 }
 
 void loop()
