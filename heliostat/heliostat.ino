@@ -3,8 +3,8 @@
 #include <math.h>
 #include "config.h"  // Adafruit IO credentials
 #include <AdafruitIO_WiFi.h>
-#include <driver/gpio.h>
-#include <esp_sleep.h>
+#include <driver/gpio.h> // Required for low-level GPIO control
+#include <esp_sleep.h> // Required for deep sleep functions
 #include <Adafruit_INA219.h>
 
 // Global variables for blip measurement and ratio
@@ -19,7 +19,7 @@ float elevation = 45.0;
 //#define BATTERY_PIN A13 // Example ADC pin for battery measurement
 
 #define SERVO_FREQ 50  // Hz
-int ENPin = 13;        // to shut off the booster
+int ENPin = 13;        // to shut off the booster (Connected to GPIO 13)
 
 // Location for Malmö, SE
 float latitude = 55.6;   // degrees
@@ -27,6 +27,17 @@ float longitude = 13.0;  // degrees
 
 float busVoltage;
 float current;
+float currentWifi; //measured after servo movment
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x41);
+
+// --- Adafruit IO Time Subscription ---
+// Assuming 'io' is defined in config.h
+AdafruitIO_Time *iso = io.time(AIO_TIME_ISO);
+// set up the group
+AdafruitIO_Group *group = io.group("heliostat");
+
+Adafruit_INA219 ina219;
 
 // Interrupt Service Routine: only increment the counter
 void IRAM_ATTR onBlip() {
@@ -50,8 +61,8 @@ float measureBlipCurrent(uint8_t pin, uint16_t windowMs) {
   Serial.print(blipCount);
   Serial.print(", mapped current: ");
   Serial.println(mappedCurrent);
-  // Return blip count  ratio
-  return blipCount / windowMs;
+  // Return blip count ratio
+  return blipCount / (float)windowMs;
 }
 // Heliostat controller with deep sleep (ESP32)
 
@@ -68,25 +79,16 @@ struct ServoConfig {
   float elMinDeg = 30.0;      // Minimum elevation in degrees (from horizon)
   float elMaxDeg = 90.0;      // Maximum elevation in degrees (straight up)
   uint16_t elMinPulse = 480;  // Pulse for elMinDeg
-  uint16_t elMaxPulse = 370;  // Pulse for elMaxDeg
+  uint16_t elMaxPulse = 370;  // Pulse for elMaxPulse
 };
 ServoConfig servoConfig;
-
-
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x41);
-
-// --- Adafruit IO Time Subscription ---
-AdafruitIO_Time *iso = io.time(AIO_TIME_ISO);
-// set up the group
-AdafruitIO_Group *group = io.group("heliostat");
-
-Adafruit_INA219 ina219;
 
 volatile time_t latestTime = 0;
 
 // Parse ISO-8601 string to time_t (UTC)
 time_t parseISO8601(const char *isoStr) {
   int year, month, day, hour, minute, second;
+  // Use T%2d to match the 'T' separator and the following hour digits
   if (sscanf(isoStr, "%4d-%2d-%2dT%2d:%2d:%2d", &year, &month, &day, &hour, &minute, &second) == 6) {
     struct tm t;
     t.tm_year = year - 1900;
@@ -195,7 +197,7 @@ void collectData() {
   Serial.println("Collect data.");
   // Measure data from the INA219 
   // Measure battery with inbuilt ADC
-  float batteryLevel = 3.33;  //analogRead(BATTERY_PIN) / 4096.0 * 3.3 * 2 * 1.1;
+  float batteryLevel = 3.33;  // Placeholder if BATTERY_PIN not used
   Serial.print("Battery Level: ");
   Serial.println(batteryLevel);
   Serial.print("ADC on CHRG:");
@@ -207,24 +209,26 @@ void collectData() {
   } else {  // measure
     delay(200);
     busVoltage = ina219.getBusVoltage_V();
-    if (ina219.getBusVoltage_V() < 3.3) {
+    if (busVoltage < 3.3) {
       Serial.println("Bus voltage low, going to sleep.");
-      // Blink LED 3 times
+      // Blink LED 3 times (ENPin is also the LED on many boards)
       for (int i = 0; i < 3; i++) {
-        digitalWrite(13, HIGH);
+        digitalWrite(ENPin, HIGH);
         delay(100);
-        digitalWrite(13, LOW);
+        digitalWrite(ENPin, LOW);
         delay(100);
       }
       esp_deep_sleep(SLEEP_MINUTES * 60 * 1000000ULL);
     }
     current = 0;
+    Serial.print("Start current sampling: ");
     Serial.println(millis());
     // Sample the current 500 times and make an average
     for (int i = 0; i < 500; i++) {
       current += ina219.getCurrent_mA();
     }
     current /= 500;
+    Serial.print("End current sampling: ");
     Serial.println(millis());
 
     Serial.print("INA219 avg current: ");
@@ -259,6 +263,8 @@ void send_data(float azi, float elv) {
   group->set("current", current);
   group->set("elevation", elv);
   group->set("azimuth", azi);
+  group->set("currentWifi", currentWifi);
+
   //group->set("blip_count", blipCountMeasured);
   //group->set("blip_ratio", blipRatio);
   //group->set("chrg_adc", chrgadc);
@@ -266,13 +272,46 @@ void send_data(float azi, float elv) {
   io.run();
 }
 
+
+// --- CRITICAL EARLY PIN STABILIZATION (Fixes GPIO 13 startup glitch) ---
+// This function runs automatically BEFORE setup() using the __attribute__((constructor))
+// to ensure ENPin (GPIO 13) is LOW immediately on power-up, reset, or wake.
+void earlyPinStabilization() __attribute__((constructor));
+void earlyPinStabilization() {
+  // 1. Immediately configure the pin to OUTPUT and set level LOW.
+  gpio_set_direction((gpio_num_t)ENPin, GPIO_MODE_OUTPUT);
+  gpio_set_level((gpio_num_t)ENPin, 0); // 0 = LOW
+
+  // 2. AGGRESSIVELY apply the hardware hold state now.
+  // This locks the pin LOW right after setting the level, preventing external circuits (like the LED pull-up)
+  // from briefly pulling it HIGH during the remainder of the boot process.
+  gpio_hold_en((gpio_num_t)ENPin); 
+}
+// --- END EARLY STABILIZATION ---
+
+
 void setup() {
   Serial.begin(115200);
-  //Serial.println("Collecting data..");
-  //collectData();
+  
+  // --- CRITICAL WAKE-UP STABILIZATION IN SETUP ---
+  // If the device woke from deep sleep, the ENPin is currently held LOW by the RTC core.
+  // This step is also REQUIRED after a cold boot/reset to release the hold applied
+  // in the aggressive earlyPinStabilization constructor.
+  
+  // 1. Release the physical hold applied by the aggressive constructor (or previous deep sleep).
+  gpio_deep_sleep_hold_dis(); 
+  gpio_hold_dis((gpio_num_t)ENPin);
+  
+  // 2. Re-assert the Arduino high-level configuration.
   pinMode(ENPin, OUTPUT);
-  digitalWrite(ENPin, LOW); //turn off booster
-  pinMode(13, OUTPUT);
+  digitalWrite(ENPin, LOW); // Ensure booster is OFF (Servo Enable LOW)
+  
+  // ENPin (13) is also the onboard LED on some ESP32-S3 boards, so this line is redundant
+  // but harmless if 13 is used as the status LED.
+  // pinMode(13, OUTPUT); 
+
+
+  collectData();
   //pinMode(BLIP_PIN, INPUT);
   //pinMode(BATTERY_PIN, INPUT);
 
@@ -284,45 +323,46 @@ void setup() {
 
   while (io.status() < AIO_CONNECTED && tries < 20) {
     Serial.print(tries++);
-    digitalWrite(13, tries % 2 + 1);
+    digitalWrite(ENPin, tries % 2 == 0 ? HIGH : LOW); // Use ENPin/LED for status blink
     Serial.println(io.statusText());
     delay(500);
   }
 
+  // Turn off LED after connecting
+  digitalWrite(ENPin, LOW);
   Serial.println();
   Serial.println(io.statusText());
   delay(10);
 
   // Wait for ISO time to arrive
   unsigned long start = millis();
-  while (latestTime < 1000000000 && millis() - start < 10000) {  // wait max 10s
+  // wait max 10s or until we get a valid time (time_t is non-zero)
+  while (latestTime == 0 && millis() - start < 10000) { 
     io.run();
     Serial.println("io.run");
     delay(100);
   }
 
-  if (latestTime > 1000000000)  // Got internet and time, get direction
+  if (latestTime > 1000000000)  // Got internet and time, get direction, start the servos 
   {
     calcSolarAzEl(latestTime, latitude, longitude, azimuth, elevation);
     
     uint16_t azPulse = mapAzimuthToPulse(azimuth);
     uint16_t elPulse = mapElevationToPulse(elevation);
 
-    // Only cahnge the panel if elevation is above 0, that is, the sun is up
+    // Only change the panel if elevation is above 0, that is, the sun is up
     if (elevation > 0) {
       Serial.println("Directing panel..");
       // Enable power boost
       digitalWrite(ENPin, HIGH);
       delay(500);
-      // start the servos if you got time
-
       pwm.begin();
       pwm.setOscillatorFrequency(27000000);
       pwm.setPWMFreq(SERVO_FREQ);
 
       pwm.setPWM(servoConfig.azimuthChannel, 0, azPulse);
-      delay(1000);  //One at a time to limit current draw
-      // Turn off azimuth and elevation servos
+      delay(1000);  // One at a time to limit current draw
+      // Turn off azimuth and elevation servos power
       pwm.setPWM(servoConfig.azimuthChannel, 0, 0);
       delay(400);
 
@@ -343,14 +383,26 @@ void setup() {
       Serial.print(" deg, pulse: ");
       Serial.println(elPulse);
     }
-    collectData();
-    send_data(azimuth, elevation);  //send before trying to move servos, TODO: differenet first mesurement in the dawn
+    // Measure current after servo movement
+    currentWifi = 0;
+    for (int i = 0; i < 500; i++) {
+      currentWifi += ina219.getCurrent_mA();
+    }
+    currentWifi /= 500;
+    send_data(azimuth, elevation); 
   } else {
-    Serial.println("No valid time received.");
+    Serial.println("No valid time received, skipping servo update.");
   }
-  //pull down ENpin to keep it off in deep sleep
+  
+  // --- DEEP SLEEP PREPARATION (LAST THING TO RUN) ---
+  
+  // 1. Configure the pin to be pulled LOW during sleep
   gpio_pulldown_en((gpio_num_t)ENPin);
   gpio_pullup_dis((gpio_num_t)ENPin);
+
+  // 2. Enable hold: This locks the pin's state (LOW) during the deep sleep and wake transition.
+  gpio_hold_en((gpio_num_t)ENPin); 
+
   Serial.println("Sleeping for 10 minutes...");
   esp_deep_sleep(SLEEP_MINUTES * 60 * 1000000ULL);  // 10 minutes in microseconds
 }
