@@ -266,6 +266,13 @@ void setup()
         displayData();
         delay(2000); // Show display for 2 seconds
         
+        // Perform accurate current measurement (500 samples)
+        collectDataAccurate();
+        
+        // Update display with accurate current measurement
+        displayData();
+        delay(2000); // Show updated display for 2 seconds
+        
         // Turn off backlight
         digitalWrite(TFT_BACKLIGHT, LOW);
         
@@ -286,9 +293,6 @@ void setup()
         Serial.print("Sleeping for remaining time: ");
         Serial.print(remaining_sleep_us / 1000000);
         Serial.println(" seconds");
-        
-        // Start accurate current measurement in background before sleep
-        collectDataAccurate();
         
         // Configure wake-up sources
         esp_sleep_enable_ext0_wakeup(BUTTON_PIN, 0); // Wake on button press (LOW)
