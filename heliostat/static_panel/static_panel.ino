@@ -1,211 +1,456 @@
-// --- Blip counting for burst current measurement ---
-#define BLIP_PIN 33 // Example pin for blip detection
-#define BATTERY_PIN A13
-
-#define ADC_SAMPLE_SIZE 500
-float zero_current = -53.0; // current for no sun. used for mapping
-volatile float blipCountMeasured = 0;
-
-void IRAM_ATTR onBlip()
-{
-    blipCountMeasured++;
-}
-
-// Attach interrupt, count blips for a fixed window, then detach
-float measureBlipCurrent(uint8_t pin, uint16_t windowMs)
-{
-    blipCountMeasured = 0;
-    attachInterrupt(digitalPinToInterrupt(pin), onBlip, FALLING);
-    unsigned long start = millis();
-    while (millis() - start < windowMs)
-    {
-        // Wait for windowMs, ISR counts blips
-    }
-    detachInterrupt(digitalPinToInterrupt(pin));
-    Serial.print(" Blip count: ");
-    Serial.print(blipCountMeasured);
-    return 1000 * blipCountMeasured / windowMs;
-}
-// Static solar panel monitor with INA219, Adafruit IO, and EPD display
+// Static solar panel monitor with INA219, SHT41, TFT display for ESP32-S2
+// Wakes every 10 minutes to send data to Adafruit IO
+// Button press on D2 wakes device to display data without internet connection
 
 #include <Wire.h>
 #include <Adafruit_INA219.h>
+#include <Adafruit_SHT4x.h>
 #include <AdafruitIO_WiFi.h>
 #include <Adafruit_GFX.h>
-// #include <Adafruit_EPD.h>
-#include "Adafruit_ThinkInk.h"
+#include <Adafruit_ST7789.h>
 #include "config.h" // Adafruit IO credentials
-// #include <WiFiClientSecure.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
+#include <sys/time.h>
+
 
 #define SLEEP_MINUTES 10
-#define BATT_SAMPLE_SIZE 500
+#define ADC_SAMPLE_SIZE 500
+#define BUTTON_PIN T12        // A1 / TOUCH9 for capacitive touch wake-up
+#define TOUCH_THRESHOLD 8000 // Touch sensitivity threshold (lower = more sensitive)
 
-#define EPD_DC 33
-#define EPD_CS 15
-#define EPD_BUSY -1 // can set to -1 to not use a pin (will wait a fixed delay)
-#define SRAM_CS 32
-#define EPD_RESET -1 // can set to -1 and share with microcontroller Reset!
-#define EPD_SPI &SPI // primary SPI
+// ESP32-S2 TFT Feather pins
+#define TFT_CS 7
+#define TFT_DC 39
+#define TFT_RST 40
+#define TFT_BACKLIGHT 45
+
+// Teal color scheme
+#define COLOR_DARK_TEAL 0x0410  // Dark teal background
+#define COLOR_MID_TEAL 0x4E9C   // Medium teal for boxes
+#define COLOR_LIGHT_TEAL 0xAF3D // Light teal for text
 
 Adafruit_INA219 ina219;
+Adafruit_SHT4x sht4 = Adafruit_SHT4x();
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 AdafruitIO_Group *group = io.group("heliostat");
-// ThinkInk_213_Tricolor_Z16 display(EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY, EPD_SPI);
+
+// RTC memory to persist data across deep sleep
+RTC_DATA_ATTR float rtc_busVoltage = 3.33;
+RTC_DATA_ATTR float rtc_current = 0;
+RTC_DATA_ATTR float rtc_temperature = 0;
+RTC_DATA_ATTR float rtc_humidity = 0;
+RTC_DATA_ATTR uint64_t rtc_remaining_sleep_us = 0; // Remaining time until next 10-min timer wake
+RTC_DATA_ATTR struct timeval rtc_sleep_enter_time = {0, 0}; // Time when we last entered deep sleep
 
 float busVoltage = 0;
 float current = 0;
-int ADC_voltage = 0;
+float temperature = 0;
+float humidity = 0;
+bool inaReady = false;
+
+void initSensors()
+{
+    Serial.println("Initializing sensors...");
+    // LC709203F Fuel Gauge removed
+
+    // INA219 Current Sensor
+    if (!inaReady)
+    {
+        Serial.println("Trying INA219 begin()...");
+        if (ina219.begin())
+        {
+            inaReady = true;
+            Serial.println("INA219 initialized");
+        }
+        else
+        {
+            Serial.println("INA219 not found at expected address (0x40). Check wiring/power.");
+        }
+    }
+}
+
 
 void collectData()
 {
-    Serial.println("Collect and send data.");
-    // Measure data from the INA219 and send to Adafruit IO using group publish
-    // Measure battery with inbuilt ADC
-    float batteryLevel = analogRead(BATTERY_PIN) / 4096.0 * 3.3 * 2 * 1.1;
-    Serial.print("Battery Level: ");
-    Serial.println(batteryLevel);
-    Serial.print("ADC on CHRG:");
-    // sample the ADC_voltage 500 times
-    for (int i = 0; i < ADC_SAMPLE_SIZE; i++)
-    {
-        ADC_voltage += analogRead(BLIP_PIN);
-    }
-    ADC_voltage /= ADC_SAMPLE_SIZE;
-    Serial.println(ADC_voltage);
+    Serial.println("Collecting sensor data...");
 
-    pinMode(BLIP_PIN, INPUT_PULLUP); // for the interrupts later
-
-    if (!ina219.begin())
+    // Measure bus voltage using INA219
+    if (inaReady)
     {
-        Serial.println("Failed to find INA219 chip");
-        busVoltage = batteryLevel;
-        current = -1;
+        busVoltage = ina219.getBusVoltage_V();
+        current = ina219.getCurrent_mA();
     }
     else
-    { // measure
-        delay(200);
-        busVoltage = ina219.getBusVoltage_V();
-        if (ina219.getBusVoltage_V() < 3.3)
-        {
-            Serial.println("Bus voltage low, going to sleep.");
-            // Blink LED 3 times
-            for (int i = 0; i < 3; i++)
-            {
-                digitalWrite(13, HIGH);
-                delay(100);
-                digitalWrite(13, LOW);
-                delay(100);
-            }
-            esp_deep_sleep(SLEEP_MINUTES * 60 * 1000000ULL);
-        }
+    {
+        Serial.println("INA219 not initialized - using RTC cached voltage");
+        busVoltage = rtc_busVoltage;
+        current = rtc_current;
+    }
+
+   
+    // Check for low voltage condition
+    if (busVoltage < 3.3)
+    {
+        Serial.println("Bus voltage critically low, going to sleep.");
+        esp_deep_sleep(SLEEP_MINUTES * 60 * 1000000ULL);
+    }
+
+    Serial.print("Quick voltage: ");
+    Serial.print(busVoltage);
+    Serial.print(" V, current: ");
+    Serial.print(current);
+    Serial.println(" mA");
+
+    // Measure SHT41 temperature and humidity
+    if (!sht4.begin())
+    {
+        Serial.println("Failed to find SHT41 chip");
+        temperature = rtc_temperature; // Use last known value
+        humidity = rtc_humidity;
+    }
+    else
+    {
+        sensors_event_t humidity_event, temp_event;
+        sht4.getEvent(&humidity_event, &temp_event);
+        temperature = temp_event.temperature;
+        humidity = humidity_event.relative_humidity;
+
+        Serial.print("Temperature: ");
+        Serial.print(temperature);
+        Serial.print(" °C, Humidity: ");
+        Serial.print(humidity);
+        Serial.println(" %");
+    }
+
+    // Store quick readings in RTC memory
+    rtc_busVoltage = busVoltage;
+    rtc_current = current;
+    rtc_temperature = temperature;
+    rtc_humidity = humidity;
+}
+
+void collectDataAccurate()
+{
+    Serial.println("Collecting accurate sensor data (500 samples)...");
+
+    // Accurate 500-sample current measurement
+    if (inaReady)
+    {
         current = 0;
-        Serial.println(millis());
-        // Sample the current 500 times and make an average
+        unsigned long start = millis();
         for (int i = 0; i < ADC_SAMPLE_SIZE; i++)
         {
             current += ina219.getCurrent_mA();
         }
         current /= ADC_SAMPLE_SIZE;
+        Serial.print("Accurate current measurement took ");
+        Serial.print(millis() - start);
+        Serial.print(" ms: ");
+        Serial.print(current);
+        Serial.println(" mA");
+
+        // Update RTC memory with accurate reading
+        rtc_current = current;
     }
-    // Serial.print(" Curr pre offset: ");
-    // Serial.print(current);
-    // current -= zero_current;//Adjust for quiescent current
-    Serial.println(millis());
+}
 
-    Serial.print(" INA219 curr: ");
-    Serial.print(current);
+void displayData()
+{
+    // Turn on backlight
+    pinMode(TFT_BACKLIGHT, OUTPUT);
+    digitalWrite(TFT_BACKLIGHT, HIGH);
 
-    Serial.print(" Voltage: ");
-    Serial.print(busVoltage);
+    // Initialize TFT
+    tft.init(135, 240);
+    tft.setRotation(3); // Landscape orientation
+    tft.fillScreen(COLOR_DARK_TEAL);
 
-    Serial.print(" V");
-    // Blip-based current measurement (100 ms window)
-    blipCountMeasured = measureBlipCurrent(BLIP_PIN, 2000);
-    float blipRatio = 0.0;
-    if (blipCountMeasured > 0)
+    // Draw rounded rectangle containers
+    tft.fillRoundRect(5, 5, 110, 55, 8, COLOR_MID_TEAL);
+    tft.fillRoundRect(125, 5, 110, 55, 8, COLOR_MID_TEAL);
+    tft.fillRoundRect(5, 70, 110, 55, 8, COLOR_MID_TEAL);
+    tft.fillRoundRect(125, 70, 110, 55, 8, COLOR_MID_TEAL);
+
+    // Set text color
+    tft.setTextColor(COLOR_LIGHT_TEAL);
+
+    // Display Temperature (top left)
+    tft.setTextSize(2);
+    tft.setCursor(15, 15);
+    tft.print("Temp");
+    tft.setTextSize(3);
+    tft.setCursor(15, 35);
+    tft.print(temperature, 1);
+    tft.setTextSize(2);
+    tft.print(" C");
+
+    // Display Voltage (top right)
+    tft.setTextSize(2);
+    tft.setCursor(135, 15);
+    tft.print("Voltage");
+    tft.setTextSize(3);
+    tft.setCursor(135, 35);
+    tft.print(busVoltage, 2);
+    tft.setTextSize(2);
+    tft.print(" V");
+
+    // Display Current (bottom left)
+    tft.setTextSize(2);
+    tft.setCursor(15, 80);
+    tft.print("Current");
+    tft.setTextSize(3);
+    tft.setCursor(15, 100);
+    tft.print(current, 0);
+    tft.setTextSize(2);
+    tft.print(" mA");
+
+    // Display Humidity (bottom right)
+    tft.setTextSize(2);
+    tft.setCursor(135, 80);
+    tft.print("Humidity");
+    tft.setTextSize(3);
+    tft.setCursor(135, 100);
+    tft.print(humidity, 0);
+    tft.setTextSize(2);
+    tft.print(" %");
+
+    Serial.println("Display updated");
+}
+
+void updateDisplay()
+{
+    // Only update the current value without redrawing entire screen
+    // Clear the current display area by redrawing the box
+    tft.fillRoundRect(125, 5, 110, 55, 8, COLOR_MID_TEAL);
+
+    tft.setTextColor(COLOR_LIGHT_TEAL);
+
+    // Redraw Current
+    tft.setTextSize(2);
+    tft.setCursor(135, 15);
+    tft.print("Current");
+    tft.setTextSize(3);
+    tft.setCursor(135, 35);
+    tft.print(current, 0);
+    tft.setTextSize(2);
+    tft.print("mA");
+
+    Serial.println("Display current updated");
+}
+
+void sendDataToAIO()
+{
+    Serial.println("Connecting to Adafruit IO...");
+    Serial.println(WIFI_SSID);
+    io.connect();
+
+    int aioTries = 0;
+    while (io.status() < AIO_CONNECTED && aioTries < 20)
     {
-        blipRatio = current / blipCountMeasured;
-        Serial.print(" INA219 current / blip count ratio: ");
-        Serial.print(blipRatio, 4);
+        Serial.println(io.statusText());
+        delay(500);
+        aioTries++;
     }
-    else
+
+    if (io.status() < AIO_CONNECTED)
     {
-        Serial.println(" No blips detected.");
+        Serial.println("Failed to connect to AIO, skipping data send");
+        Serial.println("Sleeping for 10 minutes...");
+        esp_sleep_enable_timer_wakeup(SLEEP_MINUTES * 60 * 1000000ULL);
+        esp_deep_sleep_start();
     }
+
+    Serial.println("Connected to AIO");
+    collectData(); // Collect fresh data before sending
+    // Perform accurate current measurement for cloud reporting
+    collectDataAccurate();
+
+    // Publish to Adafruit IO with stat_ prefix
+    Serial.print("Publishing stat_bus_voltage: ");
+    Serial.println(busVoltage);
+    Serial.print("Publishing stat_current: ");
+    Serial.println(current);
+    Serial.print("Publishing stat_temperature: ");
+    Serial.println(temperature);
+    Serial.print("Publishing stat_humidity: ");
+    Serial.println(humidity);
+
+    group->set("stat_bus_voltage", busVoltage);
+    // battery percent removed
+    group->set("stat_current", current);
+    group->set("stat_temperature", temperature);
+    group->set("stat_humidity", humidity);
+    group->save();
+
+    unsigned long startTime = millis();
+    unsigned long runDuration = 5000; // Run io.run() for 5 seconds
+
+    while (millis() - startTime < runDuration)
+    {
+        io.run();
+        if (io.status() == AIO_CONNECTED)
+        {
+            Serial.println("Data successfully sent to Adafruit IO, exiting early.");
+            break;
+        }
+        else
+        {
+            Serial.println("sending...");
+        }
+        delay(10); // Small delay to avoid blocking other tasks
+    }
+    Serial.println("Data published successfully");
 }
 
 void setup()
 {
     Serial.begin(115200);
-    delay(500);
-    pinMode(13, OUTPUT); // for blinking
+    //while (!Serial){};
+    // Initialize I2C bus (default speed) and sensors
+    initSensors();
+    // Determine wake-up reason
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
-    collectData();
-    // Adafruit IO setup
-    Serial.println(WIFI_SSID);
-    io.connect();
-    int aioTries = 0;
-    while (io.status() < AIO_CONNECTED && aioTries < 20)
-    {
-        Serial.println(io.statusText());
-        digitalWrite(13, aioTries % 2);
-        delay(500);
-        aioTries++;
+    Serial.print("Wake-up cause: ");
+    Serial.println(wakeup_reason);
+    // Collect initial sensor data (quick readings)
+    //collectData();
+    Serial.println(millis());
+
+    // Configure touch pad for capacitive touch wake-up
+    // GPIO 12 is TOUCH9 on ESP32-S2
+    touchAttachInterrupt(
+        BUTTON_PIN, []() {}, TOUCH_THRESHOLD);
+
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_TOUCHPAD)
+    { // Touch wake-up - display only, no internet
+        Serial.println("Touch wake-up: Display data without internet");
+
+        // Show splash screen immediately
+        pinMode(TFT_BACKLIGHT, OUTPUT);
+        digitalWrite(TFT_BACKLIGHT, HIGH);
+        tft.init(135, 240);
+        tft.setRotation(3);
+        tft.fillScreen(COLOR_DARK_TEAL);
+        tft.setTextColor(COLOR_LIGHT_TEAL);
+        tft.setTextSize(3);
+        tft.setCursor(60, 55);
+        tft.print("AXEL");
+
+        Serial.println(millis());
+        collectData();
+        collectDataAccurate(); // Accurate measurement takes time
+        displayData();         // Show quick data from RTC first
+        // updateDisplay(); // Update only the current value
+        delay(5000); // Show display for 2 seconds
+
+        // Turn off backlight
+        digitalWrite(TFT_BACKLIGHT, LOW);
+
+        // Compute elapsed sleep time since last deep sleep entry
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        uint64_t elapsed_us = 0;
+        if (rtc_sleep_enter_time.tv_sec != 0)
+        {
+            elapsed_us = (uint64_t)(now.tv_sec - rtc_sleep_enter_time.tv_sec) * 1000000ULL +
+                         (uint64_t)(now.tv_usec - rtc_sleep_enter_time.tv_usec);
+        }
+
+        if (rtc_remaining_sleep_us == 0)
+        {
+            rtc_remaining_sleep_us = SLEEP_MINUTES * 60 * 1000000ULL;
+        }
+
+        // Subtract elapsed time (from timer sleep) from remaining window
+        if (elapsed_us > 0 && elapsed_us < rtc_remaining_sleep_us)
+        {
+            rtc_remaining_sleep_us -= elapsed_us;
+        }
+
+        uint64_t remaining_sleep_us = rtc_remaining_sleep_us;
+
+        Serial.print("Sleeping for remaining time: ");
+        Serial.print(remaining_sleep_us / 1000000);
+        Serial.println(" seconds");
+
+        // Configure wake-up sources
+        touchSleepWakeUpEnable(BUTTON_PIN, TOUCH_THRESHOLD); // Enable touch wake-up on GPIO 18 (TOUCH9)
+        esp_sleep_enable_timer_wakeup(remaining_sleep_us);
+
+        // Record deep sleep entry time for next wake
+        gettimeofday(&rtc_sleep_enter_time, NULL);
+
+        esp_deep_sleep_start();
+    } // touch wake-up
+
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED)
+    { // Reset wake-up - display AND send data
+        Serial.println("Reset wake-up: Display and send data");
+
+        // Reset sleep cycle tracking for a fresh 10-minute window
+        rtc_remaining_sleep_us = SLEEP_MINUTES * 60 * 1000000ULL;
+        rtc_sleep_enter_time = {0, 0};
+
+        // Show splash screen immediately
+        pinMode(TFT_BACKLIGHT, OUTPUT);
+        digitalWrite(TFT_BACKLIGHT, HIGH);
+        tft.init(135, 240);
+        tft.setRotation(3);
+        tft.fillScreen(COLOR_DARK_TEAL);
+        tft.setTextColor(COLOR_LIGHT_TEAL);
+        tft.setTextSize(4);
+        tft.setCursor(50, 55);
+        tft.print("Axel");
+
+        collectData();
+        //  Collect accurate data after initial display
+        collectDataAccurate();
+        displayData(); // Show  data
+        // updateDisplay(); // Update only the current value
+        delay(3000); // Show display for 2 seconds
+
+        // Turn off backlight
+        digitalWrite(TFT_BACKLIGHT, LOW);
+
+        // Send data to Adafruit IO (includes accurate measurement)
+        sendDataToAIO();
+
+        Serial.print("Sleeping for ");
+        Serial.print(SLEEP_MINUTES);
+        Serial.println(" minutes");
+
+        // Configure wake-up sources
+        touchSleepWakeUpEnable(BUTTON_PIN, TOUCH_THRESHOLD); // Enable touch wake-up on GPIO 18 (TOUCH9)
+        esp_sleep_enable_timer_wakeup(SLEEP_MINUTES * 60 * 1000000ULL);
+
+        // Start next 10-minute cycle after reset
+        rtc_remaining_sleep_us = SLEEP_MINUTES * 60 * 1000000ULL;
+        gettimeofday(&rtc_sleep_enter_time, NULL);
+
+        esp_deep_sleep_start();
     }
-    /*
-      display.begin(THINKINK_TRICOLOR);
-      Serial.println("Started EPD");
+    // Timer wake-up - send data to AIO and start new cycle
+    Serial.println("Timer wake-up: send data and start new 10-minute cycle");
 
-      delay(200);
-      // Display voltage and current in large font
-      display.clearBuffer();
-      display.setTextSize(3);
-      display.setCursor(5, 10);
-      display.setTextColor(EPD_BLACK);
-      display.print(ina219.getBusVoltage_V(), 2);
-      display.print(" V");
-      display.setCursor(5, 20);
-      display.print(current, 1);
-      display.print(" mA");
+    // Send data to Adafruit IO (includes accurate measurement)
+    sendDataToAIO();
 
-      // Download and draw historic graphs
-      // bool graphError = !drawHistoricGraphs();
+    Serial.print("Sleeping for ");
+    Serial.print(SLEEP_MINUTES);
+    Serial.println(" minutes");
 
-      display.display();
-  */
+    // Configure wake-up sources
+    touchSleepWakeUpEnable(BUTTON_PIN, TOUCH_THRESHOLD); // Enable touch wake-up on GPIO 18 (TOUCH9)
+    rtc_remaining_sleep_us = SLEEP_MINUTES * 60 * 1000000ULL; // Reset cycle window
+    esp_sleep_enable_timer_wakeup(rtc_remaining_sleep_us);
+    gettimeofday(&rtc_sleep_enter_time, NULL);
 
-    // Print all values before publishing
-    Serial.print("Publishing stat-bus-voltage: ");
-    Serial.println(busVoltage);
-    Serial.print("Publishing stat_current: ");
-    Serial.println(current);
-    Serial.print("Publishing stat_blip_count: ");
-    Serial.println(blipCountMeasured);
-    Serial.print("Publishing stat_adc_chrg: ");
-    Serial.println(ADC_voltage);
-    float blip_curr_ratio = (current != 0) ? blipCountMeasured / current : 0;
-    float adc_curr_ratio = (current != 0) ? (4096 - ADC_voltage) / current : 0;
-    Serial.print("Publishing stat_blip_curr_ratio: ");
-    Serial.println(blip_curr_ratio);
-    Serial.print("Publishing stat_adc_curr_ratio: ");
-    Serial.println(adc_curr_ratio);
-
-    io.run();
-    // Publish to Adafruit IO with stat_ prefix
-    group->set("stat-bus-voltage", busVoltage);
-    group->set("stat_current", current);
-    group->set("stat_blip_count", blipCountMeasured);
-    group->set("stat_adc_chrg", ADC_voltage);
-    group->set("stat_blip_curr_ratio", blip_curr_ratio);
-    // group->set("stat_adc_curr_ratio", adc_curr_ratio);
-    group->save();
-    delay(2000);
-
-    // Sleep for 10 minutes only if no errors
-    Serial.print("Sleeping ");
-    Serial.println(SLEEP_MINUTES);
-    esp_deep_sleep(SLEEP_MINUTES * 60 * 1000000ULL);
+    esp_deep_sleep_start();
 }
 
 void loop()
 {
+    // Not used - everything happens in setup() before deep sleep
 }
