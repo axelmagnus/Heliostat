@@ -1,5 +1,6 @@
 {
     "files.associations": {
         "print": "cpp"
-    }
+    },
+    "idf.pythonInstallPath": "/usr/local/bin/python"
 }
