@@ -19,7 +19,7 @@ float elevation = 45.0;
 //#define BATTERY_PIN A13 // Example ADC pin for battery measurement
 
 #define SERVO_FREQ 50  // Hz
-int ENPin = 13;        // to shut off the booster (Connected to GPIO 13)
+int ENPin = 12;        // to shut off the booster (Connected to GPIO 13)
 
 // Location for Malmö, SE
 float latitude = 55.6;   // degrees
@@ -306,15 +306,8 @@ void setup() {
   pinMode(ENPin, OUTPUT);
   digitalWrite(ENPin, LOW); // Ensure booster is OFF (Servo Enable LOW)
   
-  // ENPin (13) is also the onboard LED on some ESP32-S3 boards, so this line is redundant
-  // but harmless if 13 is used as the status LED.
-  // pinMode(13, OUTPUT); 
-
-
+  pinMode(13, OUTPUT); 
   collectData();
-  //pinMode(BLIP_PIN, INPUT);
-  //pinMode(BATTERY_PIN, INPUT);
-
   // Adafruit IO setup
   io.connect();
   iso->onMessage(handleISO);
@@ -323,13 +316,13 @@ void setup() {
 
   while (io.status() < AIO_CONNECTED && tries < 20) {
     Serial.print(tries++);
-    digitalWrite(ENPin, tries % 2 == 0 ? HIGH : LOW); // Use ENPin/LED for status blink
+    digitalWrite(13, tries % 2 == 0 ? HIGH : LOW); // Use ENPin/LED for status blink
     Serial.println(io.statusText());
     delay(500);
   }
 
   // Turn off LED after connecting
-  digitalWrite(ENPin, LOW);
+  digitalWrite(13, LOW);
   Serial.println();
   Serial.println(io.statusText());
   delay(10);
@@ -349,8 +342,9 @@ void setup() {
     
     uint16_t azPulse = mapAzimuthToPulse(azimuth);
     uint16_t elPulse = mapElevationToPulse(elevation);
-
+    
     // Only change the panel if elevation is above 0, that is, the sun is up
+    
     if (elevation > 0) {
       Serial.println("Directing panel..");
       // Enable power boost
@@ -396,15 +390,24 @@ void setup() {
   
   // --- DEEP SLEEP PREPARATION (LAST THING TO RUN) ---
   
-  // 1. Configure the pin to be pulled LOW during sleep
+  // 1. Ensure pin is LOW before configuring hold
+  digitalWrite(ENPin, LOW);
+  gpio_set_level((gpio_num_t)ENPin, 0);
+  
+  // 2. Configure the pin to be pulled LOW during sleep
   gpio_pulldown_en((gpio_num_t)ENPin);
   gpio_pullup_dis((gpio_num_t)ENPin);
 
-  // 2. Enable hold: This locks the pin's state (LOW) during the deep sleep and wake transition.
-  gpio_hold_en((gpio_num_t)ENPin); 
+  // 3. Enable hold: This locks the pin's state (LOW) during the deep sleep and wake transition.
+  gpio_hold_en((gpio_num_t)ENPin);
+  
+  // 4. Enable deep sleep hold globally (keeps GPIO hold active during deep sleep)
+  gpio_deep_sleep_hold_en();
 
   Serial.println("Sleeping for 10 minutes...");
-  esp_deep_sleep(SLEEP_MINUTES * 60 * 1000000ULL);  // 10 minutes in microseconds
+  // Enable timer wake and then start deep sleep (preferred sequence)
+  esp_sleep_enable_timer_wakeup((uint64_t)(SLEEP_MINUTES * 60 * 1000000ULL));
+  esp_deep_sleep_start();
 }
 
 void loop() {
