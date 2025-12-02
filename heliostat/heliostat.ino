@@ -48,7 +48,7 @@ int ENPin = 12;       // to shut off the booster (Connected to GPIO 12)
 // Teal color scheme (same as static_panel)
 #define COLOR_DARK_TEAL 0x0410
 #define COLOR_MID_TEAL 0x4E9C
-#define COLOR_LIGHT_TEAL 0xAF3D
+#define COLOR_LIGHT_TEAL 0xEF3D
 
 // Location for Malmö, SE
 float latitude = 55.6;  // degrees
@@ -70,6 +70,8 @@ RTC_DATA_ATTR float rtc_cellVoltage = 3.7f;
 RTC_DATA_ATTR float rtc_chargeRate = 0.0f;
 RTC_DATA_ATTR int rtc_remaining_sleep_sec = 0;              // remaining until next timer wake in seconds
 RTC_DATA_ATTR struct timeval rtc_sleep_enter_time = {0, 0}; // time when deep sleep entered
+RTC_DATA_ATTR time_t rtc_last_unix = 0;                     // last known Unix time (UTC) from Adafruit IO
+RTC_DATA_ATTR float rtc_elevation = 0.0f;                   // last calculated solar elevation
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x41);
 
@@ -87,37 +89,66 @@ Adafruit_MAX17048 maxlipo;
 // Forward declarations
 void readSensorsQuick();
 void readAccurateCurrent();
-void renderSHT41(float temperature, float humidity);
+void renderEnv(float temperature, float humidity, float elevDeg, time_t unixTime);
 void renderBattery(float percent, float cellV, float busV, float currmA);
 void calcRemainingTime();
 
 // Fast render of stored SHT41 values (no sensor I/O)
-void renderSHT41(float temperature, float humidity)
+void renderEnv(float temperature, float humidity, float elevDeg, time_t unixTime)
 {
   pinMode(TFT_BACKLIGHT, OUTPUT);
   digitalWrite(TFT_BACKLIGHT, HIGH);
   tft.init(135, 240);
   tft.setRotation(1);
   tft.fillScreen(COLOR_DARK_TEAL);
-  tft.fillRoundRect(10, 20, 215, 45, 10, COLOR_MID_TEAL);
-  tft.fillRoundRect(10, 80, 215, 45, 10, COLOR_MID_TEAL);
-  tft.setTextColor(COLOR_LIGHT_TEAL);
+  // Same 2x2 grid as battery screen
+  tft.fillRoundRect(5, 5, 110, 55, 8, COLOR_MID_TEAL);    // UL
+  tft.fillRoundRect(125, 5, 110, 55, 8, COLOR_MID_TEAL);  // UR
+  tft.fillRoundRect(5, 70, 110, 55, 8, COLOR_MID_TEAL);   // LL
+  tft.fillRoundRect(125, 70, 110, 55, 8, COLOR_MID_TEAL); // LR
+
+  tft.setTextColor(COLOR_DARK_TEAL);
+  // Upper-left: Temp
   tft.setTextSize(2);
-  tft.setCursor(15, 25);
+  tft.setCursor(15, 15);
   tft.print("Temp");
   tft.setTextSize(3);
-  tft.setCursor(120, 25);
+  tft.setCursor(15, 35);
   tft.print(isnan(temperature) ? 0 : temperature, 1);
   tft.setTextSize(2);
   tft.print(" C");
+
+  // Upper-right: Elevation
   tft.setTextSize(2);
-  tft.setCursor(15, 85);
-  tft.print("Humidity");
+  tft.setCursor(135, 15);
+  tft.print("Elev");
   tft.setTextSize(3);
-  tft.setCursor(120, 85);
+  tft.setCursor(135, 35);
+  tft.print(elevDeg, 0);
+
+  tft.setTextSize(4);
+  tft.print(" \xF8");
+
+  // Lower-left: Humidity
+  tft.setTextSize(2);
+  tft.setCursor(15, 80);
+  tft.print("Hum");
+  tft.setTextSize(3);
+  tft.setCursor(15, 100);
   tft.print(isnan(humidity) ? 0 : humidity, 0);
   tft.setTextSize(2);
   tft.print(" %");
+
+  // Lower-right: Time HH:MM
+  struct tm *tmv = gmtime(&unixTime);
+  if (tmv)
+  {
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02d:%02d", tmv->tm_hour, tmv->tm_min);
+    tft.setTextSize(3);
+    tft.setCursor(135, 80);
+    tft.print(buf);
+  }
 }
 
 // Fast render of stored battery / power values
@@ -132,15 +163,13 @@ void renderBattery(float percent, float cellV, float currmA)
   tft.fillRoundRect(125, 5, 110, 55, 8, COLOR_MID_TEAL);
   tft.fillRoundRect(5, 70, 110, 55, 8, COLOR_MID_TEAL);
   tft.fillRoundRect(125, 70, 110, 55, 8, COLOR_MID_TEAL);
-  tft.setTextColor(COLOR_LIGHT_TEAL);
+  tft.setTextColor(COLOR_DARK_TEAL);
   tft.setTextSize(2);
   tft.setCursor(15, 15);
-  tft.print("Battery");
+  tft.print("Batt. V");
   tft.setTextSize(3);
   tft.setCursor(15, 35);
   tft.print(cellV, 2);
-  tft.setTextSize(2);
-  tft.print(" V");
   tft.setTextSize(2);
   tft.setCursor(135, 15);
   tft.print("Batt %");
@@ -148,22 +177,18 @@ void renderBattery(float percent, float cellV, float currmA)
   tft.setCursor(135, 35);
   tft.print(isnan(percent) ? 0 : percent, 1);
   tft.setTextSize(2);
-  tft.print(" %");
-  tft.setTextSize(2);
   tft.setCursor(15, 80);
-  tft.print("Current");
+  tft.print("Curr. mA");
   tft.setTextSize(3);
   tft.setCursor(15, 100);
   tft.print(currmA, 1);
-  tft.setTextSize(2);
-  tft.print(" mA");
   tft.setTextSize(2);
   tft.setCursor(135, 80);
   tft.print("Sleep");
   tft.setTextSize(3);
   tft.setCursor(135, 100);
   tft.print(rtc_remaining_sleep_sec);
-  tft.setTextSize(2);
+  // tft.setTextSize(2);
   tft.print(" s");
 }
 
@@ -210,6 +235,10 @@ time_t parseISO8601(const char *isoStr)
 void handleISO(char *data, uint16_t len)
 {
   latestTime = parseISO8601(data);
+  if (latestTime > 0)
+  {
+    rtc_last_unix = latestTime;
+  }
   // Serial.print("ISO Feed: ");
   // Serial.println(data);
 }
@@ -608,10 +637,20 @@ void setup()
     bool d1_triggered = status & (1ULL << BUTTON_D1);
     bool d2_triggered = status & (1ULL << BUTTON_D2);
 
+    // Compute current unix time based on elapsed sleep without WiFi
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    int elapsed_sec = 0;
+    if (rtc_sleep_enter_time.tv_sec != 0)
+    {
+      elapsed_sec = (int)(now.tv_sec - rtc_sleep_enter_time.tv_sec);
+    }
+    time_t current_unix = rtc_last_unix + elapsed_sec;
+
     if (d2_triggered)
     {
-      Serial.println("Button D2 -> SHT41 cached screen");
-      renderSHT41(rtc_temperature, rtc_humidity);
+      Serial.println("Button D2 -> Env cached screen");
+      renderEnv(rtc_temperature, rtc_humidity, rtc_elevation, current_unix);
     }
     else if (d1_triggered)
     {
@@ -620,7 +659,7 @@ void setup()
     }
     else
     {
-      renderSHT41(rtc_temperature, rtc_humidity);
+      renderEnv(rtc_temperature, rtc_humidity, rtc_elevation, current_unix);
     }
 
     // Keep screen on briefly, then sleep without running servos/AIO
@@ -645,7 +684,8 @@ void setup()
   {
     renderBattery(rtc_battPercent, rtc_cellVoltage, rtc_current);
     delay(2000); // Show battery screen for 2s
-    renderSHT41(rtc_temperature, rtc_humidity);
+    // Show environment with elevation and time
+    renderEnv(rtc_temperature, rtc_humidity, elevation, rtc_last_unix);
     delay(2000); // Show SHT41 screen for 2s
     // Turn off backlight to save power
     digitalWrite(TFT_BACKLIGHT, LOW);
@@ -674,7 +714,13 @@ void setup()
     Serial.println(io.statusText());
     delay(500);
   }
-
+  // if wifi connection was not successful, go to sleep
+  if (io.status() < AIO_CONNECTED)
+  {
+    Serial.println("Failed to connect to Adafruit IO, going to sleep.");
+    go2sleep(SLEEP_MINUTES * 60);
+    return;
+  }
   // Turn off LED after connecting
   digitalWrite(13, LOW);
   Serial.println();
@@ -701,6 +747,7 @@ void setup()
   if (latestTime > 1000000000) // Got internet and time, get direction, start the servos
   {
     calcSolarAzEl(latestTime, latitude, longitude, azimuth, elevation);
+    rtc_elevation = elevation; // Store for button wake displays
 
     uint16_t azPulse = mapAzimuthToPulse(azimuth);
     uint16_t elPulse = mapElevationToPulse(elevation);
