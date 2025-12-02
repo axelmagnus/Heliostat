@@ -5,6 +5,7 @@
 #include <AdafruitIO_WiFi.h>
 #include <driver/gpio.h> // Required for low-level GPIO control
 #include <esp_sleep.h> // Required for deep sleep functions
+#include <esp_task_wdt.h> // Required for watchdog timer control
 #include <Adafruit_INA219.h>
 // Added peripherals for external wake displays
 #include <Adafruit_SHT4x.h>
@@ -69,7 +70,7 @@ RTC_DATA_ATTR float rtc_humidity = 0.0f;
 RTC_DATA_ATTR float rtc_battPercent = 4.0f;
 RTC_DATA_ATTR float rtc_cellVoltage = 3.7f;
 RTC_DATA_ATTR float rtc_chargeRate = 0.0f;
-RTC_DATA_ATTR uint64_t rtc_remaining_sleep_us = 0; // remaining until next timer wake
+RTC_DATA_ATTR int rtc_remaining_sleep_sec = 0; // remaining until next timer wake in seconds
 RTC_DATA_ATTR struct timeval rtc_sleep_enter_time = {0, 0}; // time when deep sleep entered
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x41);
@@ -90,6 +91,7 @@ void readSensorsQuick();
 void readAccurateCurrent();
 void renderSHT41(float temperature, float humidity);
 void renderBattery(float percent, float cellV, float busV, float currmA);
+void calcRemainingTime();
 
 // Fast render of stored SHT41 values (no sensor I/O)
 void renderSHT41(float temperature, float humidity) {
@@ -108,7 +110,7 @@ void renderSHT41(float temperature, float humidity) {
 }
 
 // Fast render of stored battery / power values
-void renderBattery(float percent, float cellV, float busV, float currmA) {
+void renderBattery(float percent, float cellV, float currmA) {
   pinMode(TFT_BACKLIGHT, OUTPUT);
   digitalWrite(TFT_BACKLIGHT, HIGH);
   tft.init(135, 240);
@@ -119,17 +121,15 @@ void renderBattery(float percent, float cellV, float busV, float currmA) {
   tft.fillRoundRect(5, 70, 110, 55, 8, COLOR_MID_TEAL);
   tft.fillRoundRect(125, 70, 110, 55, 8, COLOR_MID_TEAL);
   tft.setTextColor(COLOR_LIGHT_TEAL);
-  tft.setTextSize(2); tft.setCursor(15, 15); tft.print("Batt %");
-  tft.setTextSize(3); tft.setCursor(15, 35); tft.print(isnan(percent)?0:percent,0); tft.setTextSize(2); tft.print(" %");
-  tft.setTextSize(2); tft.setCursor(135, 15); tft.print("Cell V");
-  tft.setTextSize(3); tft.setCursor(135, 35); tft.print(isnan(cellV)?busV:cellV,2); tft.setTextSize(2); tft.print(" V");
-  tft.setTextSize(2); tft.setCursor(15, 80); tft.print("Bus V");
-  tft.setTextSize(3); tft.setCursor(15, 100); tft.print(busV,2); tft.setTextSize(2); tft.print(" V");
-  tft.setTextSize(2); tft.setCursor(135, 80); tft.print("Current");
-  tft.setTextSize(3); tft.setCursor(135, 100); tft.print(currmA,0); tft.setTextSize(2); tft.print(" mA");
+  tft.setTextSize(2); tft.setCursor(15, 15); tft.print("Battery");
+  tft.setTextSize(3); tft.setCursor(15, 35); tft.print(cellV,2); tft.setTextSize(2); tft.print(" V");
+  tft.setTextSize(2); tft.setCursor(135, 15); tft.print("Batt %");
+  tft.setTextSize(3); tft.setCursor(135, 35); tft.print(isnan(percent)?0:percent,1); tft.setTextSize(2); tft.print(" %");
+  tft.setTextSize(2); tft.setCursor(15, 80); tft.print("Current");
+  tft.setTextSize(3); tft.setCursor(15, 100); tft.print(currmA,1); tft.setTextSize(2); tft.print(" mA");
+  tft.setTextSize(2); tft.setCursor(135, 80); tft.print("Sleep");
+  tft.setTextSize(3); tft.setCursor(135, 100); tft.print(rtc_remaining_sleep_sec); tft.setTextSize(2); tft.print(" s");
 }
-
-
 
 // --- Tuning constants ---
 struct ServoConfig {
@@ -321,6 +321,27 @@ void readSensorsQuick() {
   Serial.print("Battery: "); Serial.print(rtc_battPercent); Serial.print(" %, Cell V: "); Serial.print(rtc_cellVoltage); Serial.println(" V");
 }
 
+// Calculate remaining sleep time based on elapsed time since sleep entry
+void calcRemainingTime() {
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  int elapsed_sec = 0;
+  
+  if (rtc_sleep_enter_time.tv_sec != 0) {
+    elapsed_sec = (int)(now.tv_sec - rtc_sleep_enter_time.tv_sec);
+  }
+  
+  if (elapsed_sec < rtc_remaining_sleep_sec) {
+    rtc_remaining_sleep_sec -= elapsed_sec;
+  } else {
+    rtc_remaining_sleep_sec = 0;
+  }
+  
+  Serial.print("Remaining sleep: ");
+  Serial.print(rtc_remaining_sleep_sec);
+  Serial.println(" seconds");
+}
+
 // Accurate current averaging (500 samples) only for reset wake
 void readAccurateCurrent() {
   if (!ina219.begin()) return;
@@ -355,29 +376,10 @@ void go2sleep(int seconds) {
   
   gpio_deep_sleep_hold_en();
 
-
-  // Compute remaining sleep similar to static_panel
-  struct timeval now;
-  gettimeofday(&now, NULL);
-  uint64_t elapsed_us = 0;
-  if (rtc_sleep_enter_time.tv_sec != 0) {
-    elapsed_us = (uint64_t)(now.tv_sec - rtc_sleep_enter_time.tv_sec) * 1000000ULL +
-                 (uint64_t)(now.tv_usec - rtc_sleep_enter_time.tv_usec);
-  }
-
-  if (rtc_remaining_sleep_us == 0) {
-    rtc_remaining_sleep_us = (uint64_t)seconds * 1000000ULL;
-  }
-
-  if (elapsed_us > 0 && elapsed_us < rtc_remaining_sleep_us) {
-    rtc_remaining_sleep_us -= elapsed_us;
-  } else {
-    rtc_remaining_sleep_us = (uint64_t)seconds * 1000000ULL;
-  }
-
-  uint64_t sleep_us = rtc_remaining_sleep_us;
+  // Use the passed seconds parameter for sleep duration
+  uint64_t sleep_us = (uint64_t)seconds * 1000000ULL;
   Serial.print("Sleeping for ");
-  Serial.print(sleep_us / 1000000ULL);
+  Serial.print(seconds);
   Serial.println(" seconds");
 
   // External button wake
@@ -391,28 +393,49 @@ void go2sleep(int seconds) {
 }
 
 void send_data(float azi, float elv) {
-  // Send data to Adafruit IO using group publish - split into two batches to avoid overflow
-  Serial.println("Sending data - diminished");
+  Serial.println("Sending data to Adafruit IO...");
   
-  // Batch 1: Power and position data
-  group->set("current", rtc_current);
+  // Disable watchdog during publish
+  esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(0));
+  
+  // Send in smaller batches with generous delays
+  // Batch 1: Position data
   group->set("elevation", elv);
-  
-  group->set("temperature", rtc_temperature);
-  group->set("humidity", rtc_humidity);
-  group->set("battery_percent", rtc_battPercent);
-  group->set("cell_voltage", rtc_cellVoltage);
-  group->set("charge_rate", rtc_chargeRate);
+  group->set("azimuth", azi);
+  group->set("current", rtc_current);
   group->save();
   
-  // Run io.run() to transmit batch 2
-  int sendStart = millis();
-  while (millis() - sendStart < 3000) {
-    io.run();
-    Serial.println("sending"); // Print Adafruit IO connection status
+  for (int i = 0; i < 10; i++) {
+    io.run(100);
     delay(100);
   }
-  Serial.println("Data publish loop complete.");
+  
+  Serial.println("Position data sent");
+  
+  // Batch 2: Environmental data
+  group->set("temperature", rtc_temperature);
+  group->set("humidity", rtc_humidity);
+  group->save();
+  
+  for (int i = 0; i < 10; i++) {
+    io.run(100);
+    delay(100);
+  }
+  
+  Serial.println("Environmental data sent");
+  
+  // Batch 3: Battery data - combine to reduce publishes
+  group->set("battery_percent", rtc_battPercent);
+  group->set("cell_voltage", rtc_cellVoltage);
+  group->save();
+  for (int i = 0; i < 10; i++) { io.run(100); delay(100); }
+  Serial.println("Battery data sent");
+  
+  // Skip charge_rate for now - may be causing issues
+  // group->set("charge_rate", rtc_chargeRate);
+  // group->save();
+  
+  Serial.println("Publish complete.");
 }
 
 // --- CRITICAL EARLY PIN STABILIZATION (Fixes GPIO 13 startup glitch) ---
@@ -479,7 +502,8 @@ void setup() {
 
   // If woke by external buttons, show appropriate screen and return to sleep
   if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-  
+    calcRemainingTime();
+
     uint64_t status = esp_sleep_get_ext1_wakeup_status();
     bool d1_triggered = status & (1ULL << BUTTON_D1);
     bool d2_triggered = status & (1ULL << BUTTON_D2);
@@ -489,7 +513,7 @@ void setup() {
       renderSHT41(rtc_temperature, rtc_humidity);
     } else if (d1_triggered) {
       Serial.println("Button D1 -> Battery cached screen");
-      renderBattery(rtc_battPercent, rtc_cellVoltage, rtc_busVoltage, rtc_current);
+      renderBattery(rtc_battPercent, rtc_cellVoltage, rtc_current);
     } else {
       renderSHT41(rtc_temperature, rtc_humidity);
     }
@@ -497,19 +521,27 @@ void setup() {
     // Keep screen on briefly, then sleep without running servos/AIO
     delay(4000);
     digitalWrite(TFT_BACKLIGHT, LOW);
+
+    calcRemainingTime();
     Serial.println("Sleeping after external wake display...");
-    go2sleep(SLEEP_MINUTES * 60);
+    go2sleep(rtc_remaining_sleep_sec); // Use remaining time in seconds
     return;
   }
 
-  
   readSensorsQuick(); // SHT41 + fuel gauge cached
   // This shoudl be a reset wake, we may perform accurate current sampling
   readAccurateCurrent();
-  renderBattery(rtc_battPercent, rtc_cellVoltage, rtc_busVoltage, rtc_current);
-  delay(2000); // Show battery screen for 3s
-  renderSHT41(rtc_temperature, rtc_humidity);
-  delay(2000); // Show SHT41 screen for 2s
+  
+  // Set full sleep cycle for timer/reset wakes
+  rtc_remaining_sleep_sec = SLEEP_MINUTES * 60;
+  
+  // Only show screens on reset/power-on, not timer wake
+  if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    renderBattery(rtc_battPercent, rtc_cellVoltage, rtc_current);
+    delay(2000); // Show battery screen for 2s
+    renderSHT41(rtc_temperature, rtc_humidity);
+    delay(2000); // Show SHT41 screen for 2s
+  }
 
   // Turn off backlight to save power
   digitalWrite(TFT_BACKLIGHT, LOW);
@@ -549,6 +581,12 @@ void setup() {
     io.run();
     Serial.println(io.statusText());
     delay(100);
+  }
+  
+  // Disconnect ISO callback after getting time to prevent interference during publish
+  if (latestTime > 0) {
+    Serial.println("Disconnecting ISO time callback...");
+    iso->onMessage(NULL);
   }
 
   if (latestTime > 1000000000)  // Got internet and time, get direction, start the servos 
