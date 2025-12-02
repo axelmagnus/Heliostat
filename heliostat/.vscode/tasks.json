@@ -1,0 +1,44 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Watch: Ask on save (heliostat.ino)",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"scripts/watch_on_save.py"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Arduino: Build+Upload Heliostat (S3)",
+			"type": "shell",
+			"command": "set -e && echo '==> Detecting port' && PORT=$(ls -t /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null | head -n1) && if [ -z \"$PORT\" ]; then echo 'No serial port found - connect device first'; exit 1; fi && echo \"Found: $PORT\" && echo '==> Compiling ESP32-S3' && arduino-cli compile --fqbn esp32:esp32:adafruit_feather_esp32s3_reversetft heliostat.ino --output-dir build && echo \"==> Uploading to $PORT\" && arduino-cli upload --fqbn esp32:esp32:adafruit_feather_esp32s3_reversetft --port \"$PORT\" --input-dir build && echo '==> Upload complete'",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Arduino: Monitor (auto-detect)",
+			"type": "shell",
+			"command": "pkill -f 'arduino-cli monitor' || true && PORT=$(ls -t /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null | head -n1) && if [ -z \"$PORT\" ]; then echo 'No serial port found'; exit 1; fi && echo \"==> Monitoring $PORT at 115200\" && arduino-cli monitor --port \"$PORT\" --config baudrate=115200",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Arduino: Build+Upload+Monitor (S3)",
+			"type": "shell",
+			"command": "set -e && echo '==> Killing existing monitors' && pkill -f 'arduino-cli monitor' || true && sleep 1 && echo '==> Waiting for device (press reset or button)' && TRIES=0 && while [ $TRIES -lt 30 ]; do PORT=$(ls -t /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null | head -n1); if [ -n \"$PORT\" ]; then break; fi; echo \"Scanning ($TRIES/30)...\"; sleep 1; TRIES=$((TRIES+1)); done && if [ -z \"$PORT\" ]; then echo 'Timeout waiting for device'; exit 1; fi && echo \"Found: $PORT\" && echo '==> Compiling ESP32-S3' && arduino-cli compile --fqbn esp32:esp32:adafruit_feather_esp32s3_reversetft heliostat.ino --output-dir build && echo \"==> Uploading to $PORT\" && arduino-cli upload --fqbn esp32:esp32:adafruit_feather_esp32s3_reversetft --port \"$PORT\" --input-dir build && echo '==> Waiting for re-enumeration' && sleep 2 && NEWPORT=$(ls -t /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null | head -n1) && PORT=\"${NEWPORT:-$PORT}\" && echo \"==> Monitoring $PORT at 115200\" && arduino-cli monitor --port \"$PORT\" --config baudrate=115200",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Arduino: Monitor (scan + auto-reconnect)",
+			"type": "shell",
+			"command": "while true; do PORT=$(ls -t /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null | head -n1); if [ -z \"$PORT\" ]; then echo 'No port found. Scanning again in 2s...'; sleep 2; continue; fi; echo \"Connecting to $PORT (115200). Ctrl+C to stop.\"; arduino-cli monitor --port \"$PORT\" --config baudrate=115200 || true; echo 'Monitor disconnected. Waiting 2s...'; sleep 2; done",
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
