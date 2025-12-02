@@ -29,7 +29,7 @@ float blipRatio = 0.0;
 // --- Blip counting for burst current measurement ---
 #define BLIP_PIN A2 // Example pin for blip detection
 volatile int blipCount = 0;
-#define SLEEP_MINUTES 0.5
+#define SLEEP_MINUTES 10
 float azimuth = 180.0;
 float elevation = 45.0;
 // #define BATTERY_PIN A13 // Example ADC pin for battery measurement
@@ -706,7 +706,7 @@ void setup()
     uint16_t elPulse = mapElevationToPulse(elevation);
 
     // Only move servos on TIMER wake (sun up)
-    elevation = 20; // TEMPORARY OVERRIDE FOR TESTING
+    // elevation = 20; // TEMPORARY OVERRIDE FOR TESTING
     if (elevation > 0 && cause == ESP_SLEEP_WAKEUP_TIMER)
     {
       Serial.println("Directing panel..");
