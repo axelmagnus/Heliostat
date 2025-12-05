@@ -872,16 +872,38 @@ void setup()
     if (elevation > 0) // && cause == ESP_SLEEP_WAKEUP_TIMER)
     {
       Serial.println("Directing panel..");
-      
-      // Enable power boost FIRST (before PCA9685 init)
-      digitalWrite(ENPin, HIGH);
-      delay(500);
-      
-      // Initialize PCA9685 normally
+
+      // Initialize PCA9685 (powered by 3.3V, works without boost)
       pwm.begin();
       pwm.setOscillatorFrequency(27000000);
       pwm.setPWMFreq(SERVO_FREQ);
 
+      // Preload neutral positions (last known angles) BEFORE enabling boost
+      // This way servos start at a known position when power arrives
+      float neutralAzDeg = isnan(rtc_azimuth) ? (servoConfig.azMinDeg + servoConfig.azMaxDeg) / 2.0f : rtc_azimuth;
+      float neutralElDeg = isnan(rtc_elevation) ? (servoConfig.elMinDeg + servoConfig.elMaxDeg) / 2.0f : rtc_elevation;
+      uint16_t azNeutral = mapAzimuthToPulse(neutralAzDeg);
+      uint16_t elNeutral = mapElevationToPulse(neutralElDeg);
+
+      Serial.print("Preloading neutral: Az=");
+      Serial.print(neutralAzDeg, 1);
+      Serial.print("° (");
+      Serial.print(azNeutral);
+      Serial.print("), El=");
+      Serial.print(neutralElDeg, 1);
+      Serial.print("° (");
+      Serial.print(elNeutral);
+      Serial.println(")");
+
+      pwm.setPWM(servoConfig.azimuthChannel, 0, azNeutral);
+      pwm.setPWM(servoConfig.elevationChannel, 0, elNeutral);
+      delay(50); // Let PWM registers settle
+
+      // Now enable boost - servos should snap to preloaded neutral positions
+      digitalWrite(ENPin, HIGH);
+      delay(500); // Allow boost and servos to stabilize
+
+      // Move to target positions
       uint16_t azPulse = mapAzimuthToPulse(azimuth);
       uint16_t elPulse = mapElevationToPulse(elevation);
 
@@ -892,7 +914,6 @@ void setup()
 
       pwm.setPWM(servoConfig.azimuthChannel, 0, azPulse);
       delay(1000); // One at a time to limit current draw
-      // Turn off azimuth and elevation servos power
       pwm.setPWM(servoConfig.azimuthChannel, 0, 0);
       delay(400);
 
@@ -905,6 +926,7 @@ void setup()
       delay(1000);
       pwm.setPWM(servoConfig.elevationChannel, 0, 0);
       delay(300);
+
       // Turn off boost before measuring
       digitalWrite(ENPin, LOW);
       delay(400);
