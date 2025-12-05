@@ -1,2 +1,14 @@
 /.DS_Store
 heliostat/config.h
+ServoXL/build_servox/ServoXL_SerialControl.ino.bin
+ServoXL/build_servox/ServoXL_SerialControl.ino.bootloader.bin
+ServoXL/build_servox/ServoXL_SerialControl.ino.elf
+ServoXL/build_servox/ServoXL_SerialControl.ino.map
+ServoXL/build_servox/ServoXL_SerialControl.ino.merged.bin
+ServoXL/build_servox/ServoXL_SerialControl.ino.partitions.bin
+ServoXL/build_servox_main/ServoXL_Run.ino.bin
+ServoXL/build_servox_main/ServoXL_Run.ino.bootloader.bin
+ServoXL/build_servox_main/ServoXL_Run.ino.elf
+ServoXL/build_servox_main/ServoXL_Run.ino.map
+ServoXL/build_servox_main/ServoXL_Run.ino.merged.bin
+ServoXL/build_servox_main/ServoXL_Run.ino.partitions.bin

@@ -39,6 +39,14 @@
 			"command": "while true; do PORT=$(ls -t /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null | head -n1); if [ -z \"$PORT\" ]; then echo 'No port found. Scanning again in 2s...'; sleep 2; continue; fi; echo \"Connecting to $PORT (115200). Ctrl+C to stop.\"; arduino-cli monitor --port \"$PORT\" --config baudrate=115200 || true; echo 'Monitor disconnected. Waiting 2s...'; sleep 2; done",
 			"isBackground": false,
 			"problemMatcher": []
+		},
+		{
+			"label": "Arduino: Upload Only (skip compile)",
+			"type": "shell",
+			"command": "set -e && echo '==> Detecting port' && PORT=$(ls -t /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null | head -n1) && if [ -z \"$PORT\" ]; then echo 'No serial port found - connect device first'; exit 1; fi && echo \"Found: $PORT\" && echo '==> Uploading from build/ to $PORT' && arduino-cli upload --fqbn esp32:esp32:adafruit_feather_esp32s3_reversetft --port \"$PORT\" --input-dir build && echo '==> Upload complete'",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
 		}
 	]
 }

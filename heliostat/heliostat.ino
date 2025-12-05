@@ -299,9 +299,27 @@ struct ServoConfig
   uint16_t elMaxPulse = 350; // Pulse for elMaxDeg (80°)
 };
 ServoConfig servoConfig;
-constexpr uint8_t PCA9685_MODE1 = 0x00;
-constexpr uint8_t PCA9685_MODE1_SLEEP = 0x10;
-constexpr uint8_t PCA9685_MODE1_AI = 0x20;
+
+// PCA9685 low-level helpers (library read8/write8 are private)
+uint8_t pcaRead(uint8_t reg)
+{
+  Wire.beginTransmission(0x41);
+  Wire.write(reg);
+  Wire.endTransmission();
+  Wire.requestFrom((uint8_t)0x41, (uint8_t)1);
+  if (Wire.available())
+    return Wire.read();
+  return 0;
+}
+
+void pcaWrite(uint8_t reg, uint8_t val)
+{
+  Wire.beginTransmission(0x41);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
 volatile time_t latestTime = 0;
 
 // Parse ISO-8601 string to time_t (UTC)
@@ -850,34 +868,19 @@ void setup()
       renderStatus(latestTime, elevation, azimuth);
     }
 
-    
-
     // Only move servos if sun is up)
     if (elevation > 0) // && cause == ESP_SLEEP_WAKEUP_TIMER)
     {
       Serial.println("Directing panel..");
+      
+      // Enable power boost FIRST (before PCA9685 init)
+      digitalWrite(ENPin, HIGH);
+      delay(500);
+      
+      // Initialize PCA9685 normally
       pwm.begin();
-      uint8_t mode1 = pwm.read8(PCA9685_MODE1);
-      // Enter sleep so outputs stay off while we set neutral
-      pwm.write8(PCA9685_MODE1, mode1 | PCA9685_MODE1_SLEEP);
       pwm.setOscillatorFrequency(27000000);
       pwm.setPWMFreq(SERVO_FREQ);
-
-      // Use last-known angles (RTC) for neutral; fall back to mid-range if unset
-      float neutralAzDeg = isnan(rtc_azimuth) ? (servoConfig.azMinDeg + servoConfig.azMaxDeg) / 2.0f : rtc_azimuth;
-      float neutralElDeg = isnan(rtc_elevation) ? (servoConfig.elMinDeg + servoConfig.elMaxDeg) / 2.0f : rtc_elevation;
-      uint16_t azNeutral = mapAzimuthToPulse(neutralAzDeg);
-      uint16_t elNeutral = mapElevationToPulse(neutralElDeg);
-      pwm.setPWM(servoConfig.azimuthChannel, 0, azNeutral);
-      pwm.setPWM(servoConfig.elevationChannel, 0, elNeutral);
-
-      // Power the booster while outputs are still disabled
-      digitalWrite(ENPin, HIGH);
-      delay(400);
-
-      // Wake PCA9685 (enable outputs) and allow oscillator to settle
-      pwm.write8(PCA9685_MODE1, (mode1 | PCA9685_MODE1_AI) & ~PCA9685_MODE1_SLEEP);
-      delayMicroseconds(600);
 
       uint16_t azPulse = mapAzimuthToPulse(azimuth);
       uint16_t elPulse = mapElevationToPulse(elevation);
