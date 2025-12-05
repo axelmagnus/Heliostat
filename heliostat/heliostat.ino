@@ -12,6 +12,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include "Adafruit_MAX1704X.h"
+// Use Arduino Time library for time calculations
+#include <TimeLib.h>
 
 // Ensure TFT backlight pin is defined (guard against missing macro)
 #ifndef TFT_BACKLIGHT
@@ -23,12 +25,6 @@
 #define TFT_I2C_POWER 21
 #endif
 
-// Global variables for blip measurement and ratio
-int blipCountMeasured = 0;
-float blipRatio = 0.0;
-// --- Blip counting for burst current measurement ---
-#define BLIP_PIN A2 // Example pin for blip detection
-volatile int blipCount = 0;
 #define SLEEP_MINUTES 10
 float azimuth = 180.0;
 float elevation = 45.0;
@@ -49,7 +45,46 @@ int ENPin = 12;       // to shut off the booster (Connected to GPIO 12)
 #define COLOR_DARK_TEAL 0x0410
 #define COLOR_MID_TEAL 0x4E9C
 #define COLOR_LIGHT_TEAL 0xEF3D
+// Auto-calc timezone offset (Europe/Stockholm): +60 winter, +120 DST
+int tzOffsetMinutesForUnix(time_t t)
+{
+  // Compute DST for EU: starts last Sunday of March at 01:00 UTC,
+  // ends last Sunday of October at 01:00 UTC.
+  struct tm tmUtc = *gmtime(&t);
+  int year = tmUtc.tm_year + 1900;
 
+  auto lastSunday = [](int y, int month)
+  {
+    // Find last Sunday of given month (1-12)
+    struct tm tm = {};
+    tm.tm_year = y - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = 31; // max; mktime will normalize
+    tm.tm_hour = 1;  // 01:00 UTC boundary
+
+    // Convert UTC tm to time_t using TimeLib
+    tmElements_t te;
+    te.Year = (y - 1970); // TimeLib Year is years since 1970
+    te.Month = month;
+    te.Day = tm.tm_mday; // preserved 31 normalized by TimeLib
+    te.Hour = tm.tm_hour;
+    te.Minute = 0; // boundary hour already set
+    te.Second = 0;
+    time_t tt = makeTime(te);
+    tm = *gmtime(&tt);
+    // Walk back to Sunday
+    int backDays = (tm.tm_wday + 7 - 0) % 7; // 0=Sunday
+    return tt - backDays * 24 * 3600;
+  };
+
+  time_t dstStart = lastSunday(year, 3); // March
+  time_t dstEnd = lastSunday(year, 10);  // October
+
+  // Between start and end → DST (+120), else standard (+60)
+  return (t >= dstStart && t < dstEnd) ? 120 : 60;
+}
+
+// Removed custom timegm_utc in favor of TimeLib's makeTime
 // Location for Malmö, SE
 float latitude = 55.6;  // degrees
 float longitude = 13.0; // degrees
@@ -71,7 +106,8 @@ RTC_DATA_ATTR float rtc_chargeRate = 0.0f;
 RTC_DATA_ATTR int rtc_remaining_sleep_sec = 0;              // remaining until next timer wake in seconds
 RTC_DATA_ATTR struct timeval rtc_sleep_enter_time = {0, 0}; // time when deep sleep entered
 RTC_DATA_ATTR time_t rtc_last_unix = 0;                     // last known Unix time (UTC) from Adafruit IO
-RTC_DATA_ATTR float rtc_elevation = 0.0f;                   // last calculated solar elevation
+RTC_DATA_ATTR float rtc_elevation = 40.0f;                  // last calculated solar elevation
+RTC_DATA_ATTR float rtc_azimuth = 177.5f;                   // last calculated solar azimuth
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x41);
 
@@ -91,6 +127,7 @@ void readSensorsQuick();
 void readAccurateCurrent();
 void renderEnv(float temperature, float humidity, float elevDeg, time_t unixTime);
 void renderBattery(float percent, float cellV, float busV, float currmA);
+void renderStatus(time_t unixTime, float elevDeg, float azDeg);
 void calcRemainingTime();
 
 // Fast render of stored SHT41 values (no sensor I/O)
@@ -127,7 +164,9 @@ void renderEnv(float temperature, float humidity, float elevDeg, time_t unixTime
   tft.print(elevDeg, 0);
 
   tft.setTextSize(4);
-  tft.print(" \xF8");
+  tft.print(" \xB0");
+
+  // Change degree symbol from CP437 0xF8 to 0xB0
 
   // Lower-left: Humidity
   tft.setTextSize(2);
@@ -139,8 +178,9 @@ void renderEnv(float temperature, float humidity, float elevDeg, time_t unixTime
   tft.setTextSize(2);
   tft.print(" %");
 
-  // Lower-right: Time HH:MM
-  struct tm *tmv = gmtime(&unixTime);
+  // Lower-right: Time HH:MM (auto timezone offset EU)
+  time_t localTime = unixTime + (time_t)(tzOffsetMinutesForUnix(unixTime) * 60);
+  struct tm *tmv = gmtime(&localTime);
   if (tmv)
   {
     char buf[6];
@@ -148,7 +188,58 @@ void renderEnv(float temperature, float humidity, float elevDeg, time_t unixTime
     tft.setTextSize(3);
     tft.setCursor(135, 80);
     tft.print(buf);
+    tft.setTextSize(2);
+    tft.setCursor(135, 105);
+    tft.print(WIFI_SSID);
   }
+}
+
+// Status splash screen with time, elevation, azimuth, and SSID
+void renderStatus(time_t unixTime, float elevDeg, float azDeg)
+{
+
+  tft.fillScreen(COLOR_DARK_TEAL);
+  pinMode(TFT_BACKLIGHT, OUTPUT);
+  digitalWrite(TFT_BACKLIGHT, HIGH);
+  tft.init(135, 240);
+  tft.setRotation(1);
+  tft.setTextColor(COLOR_LIGHT_TEAL);
+
+  // Time at top (auto timezone offset EU)
+  time_t localTime = unixTime + (time_t)(tzOffsetMinutesForUnix(unixTime) * 60);
+  struct tm *tmv = gmtime(&localTime);
+  if (tmv)
+  {
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02d:%02d", tmv->tm_hour, tmv->tm_min);
+    tft.setTextSize(4);
+    tft.setCursor(80, 10);
+    tft.print(buf);
+  }
+
+  // Elevation and Azimuth on next row
+  tft.setTextSize(2);
+  tft.setCursor(10, 50);
+  tft.print("Elev: ");
+  tft.print(elevDeg, 1);
+  tft.print(" \xB0");
+
+  // Change degree symbol from CP437 0xF8 to 0xB0
+
+  tft.setCursor(10, 70);
+  tft.print("Azim: ");
+  tft.print(azDeg, 1);
+  tft.print(" \xB0");
+
+  // Change degree symbol from CP437 0xF8 to 0xB0
+
+  // Connected SSID at bottom
+  tft.setTextSize(2);
+  tft.setCursor(10, 100);
+  tft.print("Connected.");
+
+  tft.setCursor(10, 120);
+  tft.print("Sending data..");
 }
 
 // Fast render of stored battery / power values
@@ -195,19 +286,22 @@ void renderBattery(float percent, float cellV, float currmA)
 // --- Tuning constants ---
 struct ServoConfig
 {
-  uint8_t azimuthChannel = 0;
-  float azMinDeg = 80.0;     // Minimum azimuth in degrees (e.g., east)
-  float azMaxDeg = 280.0;    // Maximum azimuth in degrees (e.g., west)
-  uint16_t azMinPulse = 480; // Pulse for azMinDeg
-  uint16_t azMaxPulse = 100; // Pulse for azMaxDeg
+  uint8_t azimuthChannel = 4;
+  float azMinDeg = 80.0;     // Azimuth 80° (pulse 495)
+  float azMaxDeg = 275.0;    // Azimuth 275° (pulse 110)
+  uint16_t azMinPulse = 495; // Pulse for azMinDeg (80°)
+  uint16_t azMaxPulse = 110; // Pulse for azMaxDeg (275°)
 
-  uint8_t elevationChannel = 1;
-  float elMinDeg = 30.0;     // Minimum elevation in degrees (from horizon)
-  float elMaxDeg = 90.0;     // Maximum elevation in degrees (straight up)
-  uint16_t elMinPulse = 480; // Pulse for elMinDeg
-  uint16_t elMaxPulse = 370; // Pulse for elMaxPulse
+  uint8_t elevationChannel = 5;
+  float elMinDeg = 0.0;      // Elevation 0° (pulse 490)
+  float elMaxDeg = 80.0;     // Elevation 80° (pulse 350)
+  uint16_t elMinPulse = 490; // Pulse for elMinDeg (0°)
+  uint16_t elMaxPulse = 350; // Pulse for elMaxDeg (80°)
 };
 ServoConfig servoConfig;
+constexpr uint8_t PCA9685_MODE1 = 0x00;
+constexpr uint8_t PCA9685_MODE1_SLEEP = 0x10;
+constexpr uint8_t PCA9685_MODE1_AI = 0x20;
 volatile time_t latestTime = 0;
 
 // Parse ISO-8601 string to time_t (UTC)
@@ -672,6 +766,7 @@ void setup()
     return;
   }
 
+  // RESET or timer wake path continues here
   readSensorsQuick(); // SHT41 + fuel gauge cached
   // This shoudl be a reset wake, we may perform accurate current sampling
   readAccurateCurrent();
@@ -687,8 +782,14 @@ void setup()
     // Show environment with elevation and time
     renderEnv(rtc_temperature, rtc_humidity, elevation, rtc_last_unix);
     delay(2000); // Show SHT41 screen for 2s
-    // Turn off backlight to save power
-    digitalWrite(TFT_BACKLIGHT, LOW);
+    // Fill screen and display connecting message
+    tft.fillScreen(COLOR_DARK_TEAL);
+    tft.setTextColor(COLOR_LIGHT_TEAL);
+    tft.setTextSize(2);
+    tft.setCursor(10, 50);
+    tft.print("Connecting to:");
+    tft.setCursor(10, 80);
+    tft.print(WIFI_SSID);
   }
 
   // If voltage is low (<3.3V), skip WiFi and go back to sleep
@@ -737,38 +838,65 @@ void setup()
     delay(100);
   }
 
-  // Disconnect ISO callback after getting time to prevent interference during publish
-  /*if (latestTime > 0)
-  {
-    Serial.println("Disconnecting ISO time callback...");
-    iso->onMessage(NULL);
-  }
-*/
   if (latestTime > 1000000000) // Got internet and time, get direction, start the servos
   {
     calcSolarAzEl(latestTime, latitude, longitude, azimuth, elevation);
     rtc_elevation = elevation; // Store for button wake displays
+    rtc_azimuth = azimuth;
 
-    uint16_t azPulse = mapAzimuthToPulse(azimuth);
-    uint16_t elPulse = mapElevationToPulse(elevation);
+    // Show status splash screen on reset wake after WiFi connection
+    if (cause == ESP_SLEEP_WAKEUP_UNDEFINED)
+    {
+      renderStatus(latestTime, elevation, azimuth);
+    }
 
-    // Only move servos on TIMER wake (sun up)
-    // elevation = 20; // TEMPORARY OVERRIDE FOR TESTING
-    if (elevation > 0 && cause == ESP_SLEEP_WAKEUP_TIMER)
+    
+
+    // Only move servos if sun is up)
+    if (elevation > 0) // && cause == ESP_SLEEP_WAKEUP_TIMER)
     {
       Serial.println("Directing panel..");
-      // Enable power boost
-      digitalWrite(ENPin, HIGH);
-      delay(500);
       pwm.begin();
+      uint8_t mode1 = pwm.read8(PCA9685_MODE1);
+      // Enter sleep so outputs stay off while we set neutral
+      pwm.write8(PCA9685_MODE1, mode1 | PCA9685_MODE1_SLEEP);
       pwm.setOscillatorFrequency(27000000);
       pwm.setPWMFreq(SERVO_FREQ);
+
+      // Use last-known angles (RTC) for neutral; fall back to mid-range if unset
+      float neutralAzDeg = isnan(rtc_azimuth) ? (servoConfig.azMinDeg + servoConfig.azMaxDeg) / 2.0f : rtc_azimuth;
+      float neutralElDeg = isnan(rtc_elevation) ? (servoConfig.elMinDeg + servoConfig.elMaxDeg) / 2.0f : rtc_elevation;
+      uint16_t azNeutral = mapAzimuthToPulse(neutralAzDeg);
+      uint16_t elNeutral = mapElevationToPulse(neutralElDeg);
+      pwm.setPWM(servoConfig.azimuthChannel, 0, azNeutral);
+      pwm.setPWM(servoConfig.elevationChannel, 0, elNeutral);
+
+      // Power the booster while outputs are still disabled
+      digitalWrite(ENPin, HIGH);
+      delay(400);
+
+      // Wake PCA9685 (enable outputs) and allow oscillator to settle
+      pwm.write8(PCA9685_MODE1, (mode1 | PCA9685_MODE1_AI) & ~PCA9685_MODE1_SLEEP);
+      delayMicroseconds(600);
+
+      uint16_t azPulse = mapAzimuthToPulse(azimuth);
+      uint16_t elPulse = mapElevationToPulse(elevation);
+
+      Serial.print("Setting Az channel ");
+      Serial.print(servoConfig.azimuthChannel);
+      Serial.print(" to pulse ");
+      Serial.println(azPulse);
 
       pwm.setPWM(servoConfig.azimuthChannel, 0, azPulse);
       delay(1000); // One at a time to limit current draw
       // Turn off azimuth and elevation servos power
       pwm.setPWM(servoConfig.azimuthChannel, 0, 0);
       delay(400);
+
+      Serial.print("Setting El channel ");
+      Serial.print(servoConfig.elevationChannel);
+      Serial.print(" to pulse ");
+      Serial.println(elPulse);
 
       pwm.setPWM(servoConfig.elevationChannel, 0, elPulse);
       delay(1000);
@@ -789,6 +917,8 @@ void setup()
     }
 
     send_data(azimuth, elevation);
+
+    digitalWrite(TFT_BACKLIGHT, LOW);
   }
   else
   {

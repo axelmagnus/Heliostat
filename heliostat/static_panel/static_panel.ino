@@ -13,10 +13,9 @@
 #include <driver/rtc_io.h>
 #include <sys/time.h>
 
-
 #define SLEEP_MINUTES 10
 #define ADC_SAMPLE_SIZE 500
-#define BUTTON_PIN T12        // A1 / TOUCH9 for capacitive touch wake-up
+#define BUTTON_PIN T12       // A1 / TOUCH9 for capacitive touch wake-up
 #define TOUCH_THRESHOLD 8000 // Touch sensitivity threshold (lower = more sensitive)
 
 // ESP32-S2 TFT Feather pins
@@ -24,6 +23,7 @@
 #define TFT_DC 39
 #define TFT_RST 40
 #define TFT_BACKLIGHT 45
+#define TFT_I2C_POWER 21 // I2C bus power control
 
 // Teal color scheme
 #define COLOR_DARK_TEAL 0x0410  // Dark teal background
@@ -40,7 +40,7 @@ RTC_DATA_ATTR float rtc_busVoltage = 3.33;
 RTC_DATA_ATTR float rtc_current = 0;
 RTC_DATA_ATTR float rtc_temperature = 0;
 RTC_DATA_ATTR float rtc_humidity = 0;
-RTC_DATA_ATTR uint64_t rtc_remaining_sleep_us = 0; // Remaining time until next 10-min timer wake
+RTC_DATA_ATTR uint64_t rtc_remaining_sleep_us = 0;          // Remaining time until next 10-min timer wake
 RTC_DATA_ATTR struct timeval rtc_sleep_enter_time = {0, 0}; // Time when we last entered deep sleep
 
 float busVoltage = 0;
@@ -52,8 +52,11 @@ bool inaReady = false;
 void initSensors()
 {
     Serial.println("Initializing sensors...");
-    // LC709203F Fuel Gauge removed
-
+    // Init SHt41
+    if (!sht4.begin())
+    {
+        Serial.println("Failed to find SHT41 chip");
+    }
     // INA219 Current Sensor
     if (!inaReady)
     {
@@ -69,7 +72,6 @@ void initSensors()
         }
     }
 }
-
 
 void collectData()
 {
@@ -88,7 +90,6 @@ void collectData()
         current = rtc_current;
     }
 
-   
     // Check for low voltage condition
     if (busVoltage < 3.3)
     {
@@ -306,8 +307,12 @@ void sendDataToAIO()
 void setup()
 {
     Serial.begin(115200);
-    //while (!Serial){};
-    // Initialize I2C bus (default speed) and sensors
+    // start the I2c bus writing TFT_I2C power on
+    pinMode(TFT_I2C_POWER, OUTPUT);
+    digitalWrite(TFT_I2C_POWER, HIGH);
+    delay(300); // Wait for power to stabilize
+    // while (!Serial){};
+    //  Initialize I2C bus (default speed) and sensors
     initSensors();
     // Determine wake-up reason
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
@@ -315,7 +320,7 @@ void setup()
     Serial.print("Wake-up cause: ");
     Serial.println(wakeup_reason);
     // Collect initial sensor data (quick readings)
-    //collectData();
+    // collectData();
     Serial.println(millis());
 
     // Configure touch pad for capacitive touch wake-up
@@ -442,7 +447,7 @@ void setup()
     Serial.println(" minutes");
 
     // Configure wake-up sources
-    touchSleepWakeUpEnable(BUTTON_PIN, TOUCH_THRESHOLD); // Enable touch wake-up on GPIO 18 (TOUCH9)
+    touchSleepWakeUpEnable(BUTTON_PIN, TOUCH_THRESHOLD);      // Enable touch wake-up on GPIO 18 (TOUCH9)
     rtc_remaining_sleep_us = SLEEP_MINUTES * 60 * 1000000ULL; // Reset cycle window
     esp_sleep_enable_timer_wakeup(rtc_remaining_sleep_us);
     gettimeofday(&rtc_sleep_enter_time, NULL);
